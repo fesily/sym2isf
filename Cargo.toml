@@ -1,0 +1,33 @@
+[package]
+name = "sym2isf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Native DWARF/PDB to Ghidra extended ISF converter"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "sym2isf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sym2isf"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+gimli = "0.34"
+lzma-rs = "0.3"
+object = { version = "0.40", features = ["read", "compression", "std"] }
+pdb = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+thiserror = "2"
+uuid = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+debug = false

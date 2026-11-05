@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows compiles and runs the layout probe, so every other job can consume the
+  # same MSVC-produced PDB, PE image and oracle document.
+  windows-pdb-artifacts:
+    name: windows pdb fixture
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure msvc
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: build the probe
+        shell: cmd
+        run: |
+          if not exist pdb-artifacts mkdir pdb-artifacts
+          cl /nologo /Zi /Od /Itests\fixtures /Fdpdb-artifacts\compile.pdb /Fepdb-artifacts\probe.exe tests\fixtures\layout_probe.c /link /DEBUG:FULL /INCREMENTAL:NO /DYNAMICBASE:NO /BASE:0x140000000 /PDB:pdb-artifacts\probe.pdb
+      - name: run the oracle
+        shell: cmd
+        run: pdb-artifacts\probe.exe > pdb-artifacts\oracle.json
+      - name: upload the fixture
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdb-artifacts
+          path: pdb-artifacts/
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: windows-pdb-artifacts
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install clang and llvm (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm gcc g++ binutils
+      - name: install llvm (macos)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+      - name: configure msvc (windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pdb-artifacts
+          path: pdb-artifacts
+      - name: verify the PDB fixture is present
+        shell: bash
+        run: |
+          set -e
+          for file in probe.pdb probe.exe oracle.json; do
+            test -s "pdb-artifacts/$file" || { echo "missing pdb-artifacts/$file"; exit 1; }
+          done
+
+      - name: cargo test
+        env:
+          SYM2ISF_PDB_DIR: ${{ github.workspace }}/pdb-artifacts
+        run: cargo test --locked
+
+      # The native cases must run, never skip, in CI.
+      - name: native acceptance
+        env:
+          SYM2ISF_NATIVE_TESTS: "1"
+          SYM2ISF_PDB_DIR: ${{ github.workspace }}/pdb-artifacts
+        run: cargo test --locked --test native_frontends -- --nocapture
+
+      # Cross-platform PDB parsing: the Windows artifact is read on Unix hosts too.
+      - name: pdb parsed on this host
+        shell: bash
+        env:
+          SYM2ISF_PDB_DIR: ${{ github.workspace }}/pdb-artifacts
+        run: |
+          set -e
+          cargo run --locked --quiet -- pdb pdb-artifacts/probe.pdb \
+            --image pdb-artifacts/probe.exe --output "$RUNNER_TEMP/probe.json"
+          python3 - <<'PY'
+          import json, os
+          document = json.load(open(os.environ["RUNNER_TEMP"] + "/probe.json"))
+          target = document["metadata"]["sym2isf"]
+          assert target["target"]["pointer_size"] == 8, target
+          assert document["user_types"]["Packet"]["size"] > 0
+          assert document["symbols"]["packet_global"]["address"] >= target["image_base"]
+          print("pdb parsed:", target["target"], len(document["user_types"]), "user types")
+          PY
