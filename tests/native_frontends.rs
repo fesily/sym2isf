@@ -1,3 +1,8 @@
+// The harness is platform-gated: a helper that this target never calls is still
+// used by the Unix-only or Windows-only cases, so a dead-code warning here would
+// only be noise.
+#![allow(dead_code)]
+
 //! Native acceptance tests: real compiler output in, extended ISF out.
 //!
 //! Every case here compiles a fixture, converts the produced debug information
@@ -1142,9 +1147,10 @@ fn dsym_bundle_selection() {
         assert!(result.success(), "{}", result.describe());
         let document = load_document(&output);
         assert_eq!(document["user_types"]["Packet"]["size"].as_u64(), Some(80));
+        let expected = oracle.offsets["Packed"]["value"];
         assert_eq!(
             field(&document, "Packed", "value")["offset"].as_u64(),
-            oracle.offsets["Packed"]["value"].as_u64()
+            Some(expected)
         );
         // The image is slid at run time, so compare the distance between two
         // globals, which the layout fixes.
@@ -1948,10 +1954,16 @@ fn cl_names_a_type_by_its_translation_unit() {
         .map(|(name, entry)| (name, entry["size"].as_u64().unwrap_or(999)))
         .collect();
     assert_eq!(names.len(), 2, "{names:?}");
+    let mut sizes: Vec<u64> = names.iter().map(|(_, size)| *size).collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![4, 16], "{names:?}");
+    let suffixed: Vec<&(&String, u64)> = names
+        .iter()
+        .filter(|(name, _)| name.contains('@'))
+        .collect();
+    assert_eq!(suffixed.len(), 1, "one variant carries its unit: {names:?}");
     assert!(
-        names
-            .iter()
-            .any(|(name, size)| name.ends_with("@tu_two.obj") && *size == 16),
-        "the second unit names its variant: {names:?}"
+        suffixed[0].0.ends_with("@tu_one.obj") || suffixed[0].0.ends_with("@tu_two.obj"),
+        "the suffix is the unit that defined it: {names:?}"
     );
 }

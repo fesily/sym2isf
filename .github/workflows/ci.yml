@@ -64,6 +64,15 @@ jobs:
         with:
           arch: x64
 
+      # Type-check the other platforms' cfg-gated paths from one host, so a block
+      # that only compiles on macOS or Windows cannot rot between runs.
+      - name: type-check the foreign targets (linux)
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-pc-windows-msvc
+          cargo check --locked --tests --target aarch64-apple-darwin
+          cargo check --locked --tests --target x86_64-pc-windows-msvc
+
       - uses: actions/download-artifact@v4
         with:
           name: pdb-artifacts
