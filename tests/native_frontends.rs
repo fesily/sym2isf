@@ -533,22 +533,33 @@ fn assert_probe_layout(document: &Value, oracle: &Oracle, architecture: &str) {
 // Linux: gcc, gcc DWARF 5, clang, relocatable object, strip, compression
 // ---------------------------------------------------------------------------
 
-fn build_linux_probe(directory: &Path, compiler: &Path, output: &str, extra: &[&str]) -> PathBuf {
+fn build_host_probe(directory: &Path, compiler: &Path, output: &str, extra: &[&str]) -> PathBuf {
+    // Compile and link separately: `dsymutil` reads the debug map of the image and
+    // pulls the DWARF out of the object files it names, so on macOS they have to
+    // still exist.
+    let object = directory.join(format!("{output}.o"));
+    compile(
+        Command::new(compiler)
+            .args([
+                "-O0",
+                "-g",
+                "-fno-eliminate-unused-debug-types",
+                "-fno-pie",
+                "-c",
+            ])
+            .args(extra)
+            .arg(PROBE_C)
+            .arg("-o")
+            .arg(&object),
+    );
     let binary = directory.join(output);
-    let mut command = Command::new(compiler);
-    command
-        .args([
-            "-O0",
-            "-g",
-            "-fno-eliminate-unused-debug-types",
-            "-fno-pie",
-            "-no-pie",
-        ])
-        .args(extra)
-        .arg(PROBE_C)
-        .arg("-o")
-        .arg(&binary);
-    compile(&mut command);
+    compile(
+        Command::new(compiler)
+            .arg(&object)
+            .arg("-no-pie")
+            .arg("-o")
+            .arg(&binary),
+    );
     binary
 }
 
@@ -557,7 +568,7 @@ fn build_linux_probe(directory: &Path, compiler: &Path, output: &str, extra: &[&
 fn gcc_dwarf4_matches_the_probe_oracle() {
     let Some(cc) = tool("cc") else { return };
     let directory = tempdir("gcc4");
-    let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     let oracle = Oracle::parse(&run_binary(&binary));
     let output = directory.join("probe.json");
     let result = convert_binary(&binary, &output);
@@ -607,7 +618,7 @@ fn gcc_dwarf5_and_clang_agree_with_the_oracle() {
         variants.push(("probe-clang5", clang, vec!["-gdwarf-5"]));
     }
     for (name, compiler, flags) in variants {
-        let binary = build_linux_probe(&directory, &compiler, name, &flags);
+        let binary = build_host_probe(&directory, &compiler, name, &flags);
         // Each binary is its own oracle: addresses differ between builds.
         let oracle = Oracle::parse(&run_binary(&binary));
         let output = directory.join(format!("{name}.json"));
@@ -649,7 +660,7 @@ fn relocatable_object_needs_types_only() {
     assert!(result.success(), "{}", result.describe());
     let document = load_document(&types);
     let linked = directory.join("linked.json");
-    let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     assert!(convert_binary(&binary, &linked).success());
     let linked_document = load_document(&linked);
     assert_eq!(
@@ -674,7 +685,7 @@ fn stripped_binary_reports_no_debug_information() {
         return;
     };
     let directory = tempdir("strip");
-    let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     let stripped = directory.join("probe.stripped");
     std::fs::copy(&binary, &stripped).unwrap();
     compile(Command::new(strip).arg(&stripped));
@@ -693,7 +704,7 @@ fn compressed_debug_sections_still_convert() {
         return;
     };
     let directory = tempdir("compressed");
-    let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     let plain = directory.join("plain.json");
     assert!(convert(&binary, &plain, &[]).success());
     let compressed = directory.join("probe.compressed");
@@ -721,7 +732,7 @@ fn separate_debug_file_is_verified() {
         return;
     };
     let directory = tempdir("separate");
-    let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4", "-Wl,--build-id"]);
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4", "-Wl,--build-id"]);
     let debug = directory.join("probe.debug");
     let stripped = directory.join("probe.stripped");
     std::fs::copy(&binary, &stripped).unwrap();
@@ -745,7 +756,7 @@ fn separate_debug_file_is_verified() {
 
     // A debug file from another build is rejected.
     let other = directory.join("other.debug");
-    let other_binary = build_linux_probe(&directory, &cc, "probe-other", &["-gdwarf-5"]);
+    let other_binary = build_host_probe(&directory, &cc, "probe-other", &["-gdwarf-5"]);
     compile(
         Command::new(objcopy)
             .arg("--only-keep-debug")
@@ -773,7 +784,7 @@ fn separate_debug_file_is_verified() {
 fn split_dwarf_requires_its_companion() {
     let Some(cc) = tool("cc") else { return };
     let directory = tempdir("split");
-    let binary = build_linux_probe(
+    let binary = build_host_probe(
         &directory,
         &cc,
         "probe-split",
@@ -800,7 +811,7 @@ fn cpp_virtual_base_becomes_opaque() {
         return;
     };
     let directory = tempdir("cpp");
-    let binary = directory.join("probe-cpp");
+    let object = directory.join("probe-cpp.o");
     compile(
         Command::new(&cxx)
             .args([
@@ -809,9 +820,17 @@ fn cpp_virtual_base_becomes_opaque() {
                 "-gdwarf-4",
                 "-fno-eliminate-unused-debug-types",
                 "-fno-pie",
-                "-no-pie",
+                "-c",
             ])
             .arg(CPP_PROBE)
+            .arg("-o")
+            .arg(&object),
+    );
+    let binary = directory.join("probe-cpp");
+    compile(
+        Command::new(&cxx)
+            .arg(&object)
+            .arg("-no-pie")
             .arg("-o")
             .arg(&binary),
     );
@@ -1082,14 +1101,16 @@ fn dsym_bundle_selection() {
         let Some(dsymutil) = tool_any(&["dsymutil"]) else {
             return;
         };
-        let binary = directory.join("probe");
+        let object = directory.join("probe.o");
         compile(
             Command::new(&clang)
-                .args(["-O0", "-g", "-gdwarf-4"])
+                .args(["-O0", "-g", "-gdwarf-4", "-c"])
                 .arg(PROBE_C)
                 .arg("-o")
-                .arg(&binary),
+                .arg(&object),
         );
+        let binary = directory.join("probe");
+        compile(Command::new(&clang).arg(&object).arg("-o").arg(&binary));
         let bundle = directory.join("probe.dSYM");
         compile(Command::new(dsymutil).arg(&binary).arg("-o").arg(&bundle));
         let oracle = Oracle::parse(&run_binary(&binary));
@@ -1118,7 +1139,7 @@ fn dsym_bundle_selection() {
 fn cli_output_contract_on_a_real_input() {
     let Some(cc) = tool("cc") else { return };
     let directory = tempdir("contract");
-    let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     let first = directory.join("first.json");
     let second = directory.join("second.json");
     assert!(convert_binary(&binary, &first).success());
@@ -1647,11 +1668,19 @@ fn dynamic_arrays_are_rejected_with_their_record() {
          int main(void) { return sum(4) + holder_global.fixed; }\n",
     )
     .unwrap();
+    let object = directory.join("vla.o");
+    compile(
+        Command::new(&cc)
+            .args(["-O0", "-g", "-gdwarf-4", "-fno-pie", "-c"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object),
+    );
     let binary = directory.join("vla");
     compile(
         Command::new(&cc)
-            .args(["-O0", "-g", "-gdwarf-4", "-fno-pie", "-no-pie"])
-            .arg(&source)
+            .arg(&object)
+            .arg("-no-pie")
             .arg("-o")
             .arg(&binary),
     );
@@ -1675,7 +1704,7 @@ fn dynamic_arrays_are_rejected_with_their_record() {
 // The compilation unit is the name domain
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn compilation_unit_is_the_name_domain() {
     let Some(cc) = tool("cc") else { return };
@@ -1868,6 +1897,7 @@ fn cl_names_a_type_by_its_translation_unit() {
                 "/INCREMENTAL:NO",
                 "/DYNAMICBASE:NO",
                 "/entry:read_one",
+                "/subsystem:console",
                 "/nodefaultlib",
             ])
             .arg("/BASE:0x140000000")
