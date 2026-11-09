@@ -163,6 +163,42 @@ fn convert_pdb(pdb: &Path, output: &Path, extra: &[&str]) -> CliOutput {
     cli(args)
 }
 
+/// Convert a linked executable.
+///
+/// Apple's linker keeps DWARF in the object files, so on macOS the matching dSYM
+/// bundle is handed to the converter; elsewhere the executable carries the debug
+/// information itself.
+fn convert_binary(input: &Path, output: &Path) -> CliOutput {
+    #[cfg(target_os = "macos")]
+    let extra: Vec<String> = {
+        let dsymutil = find_tool("dsymutil").unwrap_or_else(|| {
+            panic!("SYM2ISF_NATIVE_TESTS requires dsymutil on macOS");
+        });
+        let bundle = input.with_extension("dSYM");
+        compile(Command::new(dsymutil).arg(input).arg("-o").arg(&bundle));
+        vec![
+            "--debug-file".to_string(),
+            bundle.to_string_lossy().into_owned(),
+        ]
+    };
+    #[cfg(not(target_os = "macos"))]
+    let extra: Vec<String> = Vec::new();
+    let borrowed: Vec<&str> = extra.iter().map(String::as_str).collect();
+    convert(input, output, &borrowed)
+}
+
+/// True when the given clang build can emit code for `target`.
+fn clang_has_target(clang: &Path, target: &str) -> bool {
+    let output = Command::new(clang).arg("--print-targets").output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            text.contains(target)
+        }
+        _ => false,
+    }
+}
+
 fn load_document(path: &Path) -> Value {
     let bytes =
         std::fs::read(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
@@ -524,7 +560,7 @@ fn gcc_dwarf4_matches_the_probe_oracle() {
     let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     let oracle = Oracle::parse(&run_binary(&binary));
     let output = directory.join("probe.json");
-    let result = convert(&binary, &output, &[]);
+    let result = convert_binary(&binary, &output);
     assert!(result.success(), "{}", result.describe());
     let document = load_document(&output);
     assert_probe_layout(&document, &oracle, host_architecture());
@@ -554,7 +590,7 @@ fn host_architecture() -> &'static str {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn gcc_dwarf5_and_clang_agree_with_the_oracle() {
     let Some(cc) = tool("cc") else { return };
@@ -575,7 +611,7 @@ fn gcc_dwarf5_and_clang_agree_with_the_oracle() {
         // Each binary is its own oracle: addresses differ between builds.
         let oracle = Oracle::parse(&run_binary(&binary));
         let output = directory.join(format!("{name}.json"));
-        let result = convert(&binary, &output, &[]);
+        let result = convert_binary(&binary, &output);
         assert!(result.success(), "{name}: {}", result.describe());
         let document = load_document(&output);
         assert_probe_layout(&document, &oracle, host_architecture());
@@ -614,7 +650,7 @@ fn relocatable_object_needs_types_only() {
     let document = load_document(&types);
     let linked = directory.join("linked.json");
     let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
-    assert!(convert(&binary, &linked, &[]).success());
+    assert!(convert_binary(&binary, &linked).success());
     let linked_document = load_document(&linked);
     assert_eq!(
         document["user_types"]["Packet"], linked_document["user_types"]["Packet"],
@@ -649,7 +685,7 @@ fn stripped_binary_reports_no_debug_information() {
     assert!(!output.exists());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn compressed_debug_sections_still_convert() {
     let Some(cc) = tool("cc") else { return };
@@ -780,7 +816,7 @@ fn cpp_virtual_base_becomes_opaque() {
             .arg(&binary),
     );
     let output = directory.join("cpp.json");
-    let result = convert(&binary, &output, &[]);
+    let result = convert_binary(&binary, &output);
     assert!(result.success(), "{}", result.describe());
     let document = load_document(&output);
 
@@ -845,6 +881,10 @@ fn symbol_bytes(path: &Path) -> (u64, Vec<u8>) {
 #[test]
 fn big_endian_bitfields_decode_to_the_initializer() {
     let Some(clang) = tool("clang") else { return };
+    if !clang_has_target(&clang, "powerpc64") {
+        eprintln!("skipping: this clang build has no powerpc64 target");
+        return;
+    }
     let directory = tempdir("bigendian");
     for (tag, standard) in [("dwarf4", "-gdwarf-4"), ("dwarf5", "-gdwarf-5")] {
         let object = directory.join(format!("bf-be-{tag}.o"));
@@ -1081,14 +1121,14 @@ fn cli_output_contract_on_a_real_input() {
     let binary = build_linux_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
     let first = directory.join("first.json");
     let second = directory.join("second.json");
-    assert!(convert(&binary, &first, &[]).success());
-    assert!(convert(&binary, &second, &[]).success());
+    assert!(convert_binary(&binary, &first).success());
+    assert!(convert_binary(&binary, &second).success());
     let a = std::fs::read(&first).unwrap();
     let b = std::fs::read(&second).unwrap();
     assert_eq!(a, b, "repeated conversions are byte identical");
 
     let packed = directory.join("probe.json.xz");
-    assert!(convert(&binary, &packed, &[]).success());
+    assert!(convert_binary(&binary, &packed).success());
     let mut decompressed = Vec::new();
     lzma_rs::xz_decompress(
         &mut std::io::Cursor::new(std::fs::read(&packed).unwrap()),
@@ -1098,14 +1138,14 @@ fn cli_output_contract_on_a_real_input() {
     assert_eq!(decompressed, a, "xz and json carry the same bytes");
 
     // An existing output is never overwritten.
-    let error = convert(&binary, &first, &[]);
+    let error = convert_binary(&binary, &first);
     assert_eq!(error.status, Some(1), "{}", error.describe());
     assert!(error.stderr.contains("OutputExists"), "{}", error.stderr);
     assert_eq!(std::fs::read(&first).unwrap(), a);
 
     // A wrong suffix is reported, not guessed.
     let bad = directory.join("probe.txt");
-    let error = convert(&binary, &bad, &[]);
+    let error = convert_binary(&binary, &bad);
     assert_eq!(error.status, Some(1), "{}", error.describe());
     assert!(
         error.stderr.contains("UnsupportedOutput"),
@@ -1116,7 +1156,7 @@ fn cli_output_contract_on_a_real_input() {
 
     // Missing parent directory is an I/O error, not a silent mkdir.
     let missing = directory.join("no-such-dir/probe.json");
-    let error = convert(&binary, &missing, &[]);
+    let error = convert_binary(&binary, &missing);
     assert_eq!(error.status, Some(1), "{}", error.describe());
     assert!(error.stderr.contains("Io"), "{}", error.stderr);
 }
@@ -1616,7 +1656,7 @@ fn dynamic_arrays_are_rejected_with_their_record() {
             .arg(&binary),
     );
     let output = directory.join("vla.json");
-    let result = convert(&binary, &output, &[]);
+    let result = convert_binary(&binary, &output);
     assert_eq!(result.status, Some(1), "{}", result.describe());
     assert!(
         result.stderr.contains("UnsupportedLayout"),
@@ -1671,7 +1711,7 @@ fn compilation_unit_is_the_name_domain() {
     let binary = directory.join("probe");
     compile(Command::new(&cc).args(&objects).arg("-o").arg(&binary));
     let output = directory.join("probe.json");
-    let result = convert(&binary, &output, &[]);
+    let result = convert_binary(&binary, &output);
     assert!(result.success(), "{}", result.describe());
     let document = load_document(&output);
 
@@ -1822,7 +1862,14 @@ fn cl_names_a_type_by_its_translation_unit() {
             .arg(format!("/Fd{}", directory.join("compile.pdb").display()))
             .arg(format!("/Fe:{}", exe.display()))
             .args(&objects)
-            .args(["/link", "/DEBUG:FULL", "/INCREMENTAL:NO", "/DYNAMICBASE:NO"])
+            .args([
+                "/link",
+                "/DEBUG:FULL",
+                "/INCREMENTAL:NO",
+                "/DYNAMICBASE:NO",
+                "/entry:read_one",
+                "/nodefaultlib",
+            ])
             .arg("/BASE:0x140000000")
             .arg(format!("/PDB:{}", pdb.display())),
     );

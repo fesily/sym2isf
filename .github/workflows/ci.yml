@@ -88,21 +88,24 @@ jobs:
           SYM2ISF_PDB_DIR: ${{ github.workspace }}/pdb-artifacts
         run: cargo test --locked --test native_frontends -- --nocapture
 
-      # Cross-platform PDB parsing: the Windows artifact is read on Unix hosts too.
+      # Cross-platform PDB parsing: the Windows artifact is read on this host too.
+      # `shell: python` keeps the same script working on Linux, macOS and Windows.
       - name: pdb parsed on this host
-        shell: bash
-        env:
-          SYM2ISF_PDB_DIR: ${{ github.workspace }}/pdb-artifacts
+        shell: python
         run: |
-          set -e
-          cargo run --locked --quiet -- pdb pdb-artifacts/probe.pdb \
-            --image pdb-artifacts/probe.exe --output "$RUNNER_TEMP/probe.json"
-          python3 - <<'PY'
-          import json, os
-          document = json.load(open(os.environ["RUNNER_TEMP"] + "/probe.json"))
+          import json, pathlib, subprocess, tempfile
+          output = pathlib.Path(tempfile.gettempdir()) / "probe.json"
+          if output.exists():
+              output.unlink()
+          subprocess.run(
+              ["cargo", "run", "--locked", "--quiet", "--", "pdb",
+               "pdb-artifacts/probe.pdb", "--image", "pdb-artifacts/probe.exe",
+               "--output", str(output)],
+              check=True,
+          )
+          document = json.loads(output.read_text())
           target = document["metadata"]["sym2isf"]
           assert target["target"]["pointer_size"] == 8, target
           assert document["user_types"]["Packet"]["size"] > 0
           assert document["symbols"]["packet_global"]["address"] >= target["image_base"]
           print("pdb parsed:", target["target"], len(document["user_types"]), "user types")
-          PY
