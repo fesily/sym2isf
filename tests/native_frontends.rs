@@ -503,7 +503,10 @@ fn assert_probe_layout(document: &Value, oracle: &Oracle, architecture: &str) {
         "bit-fields cover the probe bytes"
     );
 
-    // Global objects carry the addresses the program printed.
+    // Global objects carry the addresses the program printed. macOS slides a PIE
+    // image at load time, so the comparison allows exactly one constant shift for
+    // the whole document instead of one per symbol.
+    let mut slide: Option<i128> = None;
     for (name, address) in &oracle.addresses {
         if name == "packet_callback" {
             continue; // published in `functions`, checked below
@@ -511,17 +514,27 @@ fn assert_probe_layout(document: &Value, oracle: &Oracle, architecture: &str) {
         let entry = document["symbols"]
             .get(name)
             .unwrap_or_else(|| panic!("symbol {name} is missing"));
-        assert_eq!(
-            entry["address"].as_u64(),
-            Some(*address),
-            "address of {name}"
-        );
+        let recorded = entry["address"].as_u64().unwrap_or_else(|| {
+            panic!("symbol {name} has no address");
+        });
+        let offset = i128::from(*address) - i128::from(recorded);
+        match slide {
+            None => slide = Some(offset),
+            Some(expected) => assert_eq!(
+                offset, expected,
+                "symbol {name} differs from the rest of the image"
+            ),
+        }
     }
     let callback_entry = &document["functions"]["packet_callback"];
+    let callback = callback_entry["address"]
+        .as_u64()
+        .expect("callback address");
+    let expected = i128::from(oracle.addresses["packet_callback"]) - slide.unwrap_or(0);
     assert_eq!(
-        callback_entry["address"].as_u64(),
-        Some(oracle.addresses["packet_callback"]),
-        "address of packet_callback"
+        i128::from(callback),
+        expected,
+        "packet_callback shares the image shift"
     );
     assert_eq!(
         callback_entry["parameters"].as_array().map(Vec::len),
@@ -1130,8 +1143,22 @@ fn dsym_bundle_selection() {
         let document = load_document(&output);
         assert_eq!(document["user_types"]["Packet"]["size"].as_u64(), Some(80));
         assert_eq!(
-            document["symbols"]["packet_global"]["address"].as_u64(),
-            Some(oracle.addresses["packet_global"])
+            field(&document, "Packed", "value")["offset"].as_u64(),
+            oracle.offsets["Packed"]["value"].as_u64()
+        );
+        // The image is slid at run time, so compare the distance between two
+        // globals, which the layout fixes.
+        let packet = document["symbols"]["packet_global"]["address"]
+            .as_u64()
+            .expect("packet_global");
+        let bits = document["symbols"]["bits_global"]["address"]
+            .as_u64()
+            .expect("bits_global");
+        assert_eq!(
+            i128::from(bits) - i128::from(packet),
+            i128::from(oracle.addresses["bits_global"])
+                - i128::from(oracle.addresses["packet_global"]),
+            "global layout distance"
         );
     }
 }
