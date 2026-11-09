@@ -284,6 +284,17 @@ enum Spec {
     Unsupported(String),
 }
 
+/// An aggregate record on its way from the TPI stream into the type graph.
+#[derive(Debug)]
+struct CompositeParts {
+    name: String,
+    kind: CompositeKind,
+    size: u64,
+    forward: bool,
+    members: Vec<MemberSpec>,
+    unsupported: Option<String>,
+}
+
 #[derive(Debug)]
 struct MemberSpec {
     name: Option<String>,
@@ -823,7 +834,7 @@ impl<'t> Resolver<'t> {
         if let Some(fields) = fields {
             // A field list this crate cannot decode would otherwise look like an
             // aggregate without members; report it instead.
-            if self.types.get(&fields.0).is_none() && fields.0 >= 0x1000 {
+            if !self.types.contains_key(&fields.0) && fields.0 >= 0x1000 {
                 let detail = self
                     .unparsed
                     .get(&fields.0)
@@ -1162,7 +1173,17 @@ impl<'t> Resolver<'t> {
                 forward,
                 members,
                 unsupported,
-            } => self.composite_type(index, name, kind, size, forward, members, unsupported)?,
+            } => self.composite_type(
+                index,
+                CompositeParts {
+                    name,
+                    kind,
+                    size,
+                    forward,
+                    members,
+                    unsupported,
+                },
+            )?,
             Spec::Enumeration {
                 underlying,
                 size,
@@ -1237,16 +1258,15 @@ impl<'t> Resolver<'t> {
         Ok(id)
     }
 
-    fn composite_type(
-        &mut self,
-        index: u32,
-        name: String,
-        kind: CompositeKind,
-        size: u64,
-        forward: bool,
-        members: Vec<MemberSpec>,
-        unsupported: Option<String>,
-    ) -> Result<TypeId> {
+    fn composite_type(&mut self, index: u32, spec: CompositeParts) -> Result<TypeId> {
+        let CompositeParts {
+            name,
+            kind,
+            size,
+            forward,
+            members,
+            unsupported,
+        } = spec;
         if forward {
             let reason = match self.definition_for(index)? {
                 Link::Single(definition) => {
@@ -1858,7 +1878,7 @@ fn note_type(symbol: &pdb::SymbolData<'_>, out: &mut BTreeSet<u32>) {
 fn source_basename(name: &str) -> String {
     let trimmed = name.trim();
     let base = trimmed
-        .rsplit(|character| character == '/' || character == '\\' || character == ')')
+        .rsplit(|character| ['/', '\\', ')'].contains(&character))
         .next()
         .unwrap_or(trimmed)
         .trim();

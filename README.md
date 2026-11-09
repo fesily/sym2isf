@@ -187,6 +187,12 @@ link a freestanding PDB locally with `clang` plus `lld-link` when those are
 available. `.github/workflows/ci.yml` runs the Windows fixture job first and then
 parses that same PDB on Linux, macOS and Windows.
 
+The Linux job carries the extra weight: it builds the probe as a 32-bit image
+(`cc -m32`, so `pointer_size`, member offsets and bit-fields are checked on a
+second ABI), type-checks the macOS- and Windows-only test paths with
+`cargo check --tests --target ...`, and is the formatting/lint gate
+(`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`).
+
 In WSL the MSVC toolchain is reachable through interop, so the Windows fixture can
 also be produced locally:
 

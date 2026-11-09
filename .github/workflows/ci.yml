@@ -52,7 +52,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm gcc g++ binutils
+          sudo apt-get install -y clang llvm gcc g++ binutils gcc-multilib libc6-dev-i386
       - name: install llvm (macos)
         if: runner.os == 'macOS'
         run: |
@@ -63,6 +63,14 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
+      # The Linux job is also the quality gate: formatting and lints must be clean
+      # before the platform matrix is meaningful.
+      - name: formatting and lints (linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets -- -D warnings
 
       # Type-check the other platforms' cfg-gated paths from one host, so a block
       # that only compiles on macOS or Windows cannot rot between runs.

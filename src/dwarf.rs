@@ -223,7 +223,7 @@ fn source_basename(name: &str) -> Option<String> {
         return None;
     }
     let base = trimmed
-        .rsplit(|character| character == '/' || character == '\\')
+        .rsplit(|character| ['/', '\\'].contains(&character))
         .next()
         .unwrap_or(trimmed)
         .trim();
@@ -266,6 +266,25 @@ fn architecture_name(arch: object::Architecture) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Architectures of a universal binary with the range of each slice.
+// The offset conversion is required for `FatArch32` and redundant for `FatArch64`,
+// which is what the single generic body is for.
+#[allow(clippy::useless_conversion)]
+fn fat_architectures<F: FatArch>(
+    fat: &object::read::macho::MachOFatFile<'_, F>,
+) -> Vec<(String, u64, u64)> {
+    fat.arches()
+        .iter()
+        .map(|arch| {
+            (
+                architecture_name(arch.architecture()).unwrap_or_else(|| "unknown".to_string()),
+                arch.offset().into(),
+                arch.size().into(),
+            )
+        })
+        .collect()
+}
+
 /// Select the requested architecture slice from a Mach-O universal binary.
 fn select_slice<'a>(
     bytes: &'a [u8],
@@ -283,34 +302,14 @@ fn select_slice<'a>(
                 path: path.into(),
                 detail: e.to_string(),
             })?;
-            fat.arches()
-                .iter()
-                .map(|arch| {
-                    (
-                        architecture_name(arch.architecture())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        arch.offset().into(),
-                        arch.size().into(),
-                    )
-                })
-                .collect()
+            fat_architectures(&fat)
         }
         object::FileKind::MachOFat64 => {
             let fat = MachOFatFile64::parse(bytes).map_err(|e| Error::Corrupt {
                 path: path.into(),
                 detail: e.to_string(),
             })?;
-            fat.arches()
-                .iter()
-                .map(|arch| {
-                    (
-                        architecture_name(arch.architecture())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        arch.offset().into(),
-                        arch.size().into(),
-                    )
-                })
-                .collect()
+            fat_architectures(&fat)
         }
         _ => return Ok((bytes, None)),
     };
@@ -811,6 +810,14 @@ struct Collector<'a> {
     signatures: BTreeMap<u64, DieKey>,
 }
 
+/// Where a DIE lives: its unit, the section holding it and the unit's offset.
+#[derive(Clone, Copy, Debug)]
+struct UnitScope {
+    section: Section,
+    base: UnitSectionOffset<usize>,
+    unit: usize,
+}
+
 impl<'a> Collector<'a> {
     fn walk(
         &mut self,
@@ -818,9 +825,7 @@ impl<'a> Collector<'a> {
         parent: Option<DieKey>,
         scope: Option<DieKey>,
         depth: usize,
-        unit_index: usize,
-        section: Section,
-        base: &UnitSectionOffset<usize>,
+        location: UnitScope,
     ) -> Result<()> {
         if depth > MAX_DIE_DEPTH {
             return Err(Error::Corrupt {
@@ -829,7 +834,7 @@ impl<'a> Collector<'a> {
             });
         }
         let entry = node.entry();
-        let key = die_key(section, base, entry.offset());
+        let key = die_key(location.section, &location.base, entry.offset());
         let attrs: Vec<(DwAt, AttributeValue<SectionReader<'a>>)> = entry
             .attrs()
             .iter()
@@ -845,7 +850,7 @@ impl<'a> Collector<'a> {
                 .find(|(name, _)| *name == attribute)
                 .map(|(_, value)| value.clone());
             if let Some(value) = value {
-                if let Some(target) = reference_key(section, base, &value) {
+                if let Some(target) = reference_key(location.section, &location.base, &value) {
                     self.specified_by.entry(target).or_default().push(key);
                 }
             }
@@ -860,24 +865,16 @@ impl<'a> Collector<'a> {
                 children: Vec::new(),
                 parent,
                 scope,
-                unit: unit_index,
-                base: *base,
+                unit: location.unit,
+                base: location.base,
             },
         );
         let mut children = Vec::new();
         let mut iter = node.children();
         while let Some(child) = iter.next().map_err(|e| corrupt(&self.path, e))? {
-            let child_key = die_key(section, base, child.entry().offset());
+            let child_key = die_key(location.section, &location.base, child.entry().offset());
             children.push(child_key);
-            self.walk(
-                child,
-                Some(key),
-                child_scope,
-                depth + 1,
-                unit_index,
-                section,
-                base,
-            )?;
+            self.walk(child, Some(key), child_scope, depth + 1, location)?;
         }
         if let Some(data) = self.index.get_mut(&key) {
             data.children = children;
@@ -942,7 +939,17 @@ impl<'a> Frontend<'a> {
                 .entries_tree(None)
                 .map_err(|e| corrupt(&self.path, e))?;
             let root = tree.root().map_err(|e| corrupt(&self.path, e))?;
-            collector.walk(root, None, None, 0, unit_index, section, &base)?;
+            collector.walk(
+                root,
+                None,
+                None,
+                0,
+                UnitScope {
+                    section,
+                    base,
+                    unit: unit_index,
+                },
+            )?;
             if let UnitType::Type {
                 type_signature,
                 type_offset,
@@ -1644,10 +1651,7 @@ impl<'a> Frontend<'a> {
         let _ = key;
         match die.attr(constants::DW_AT_type) {
             None => Ok(None),
-            Some(value) => self
-                .reference_target(die, value)
-                .map(Some)
-                .map_err(|error| error),
+            Some(value) => self.reference_target(die, value).map(Some),
         }
     }
 

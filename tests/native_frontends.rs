@@ -1622,6 +1622,70 @@ fn cl_and_its_pdb_match_the_probe_oracle() {
 }
 
 // ---------------------------------------------------------------------------
+// 32-bit Linux target
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[test]
+fn thirty_two_bit_target_layout() {
+    let Some(cc) = tool("cc") else { return };
+    let directory = tempdir("i386");
+    let object = directory.join("probe32.o");
+    // Emitting 32-bit code needs the multilib runtime (gcc-multilib in CI); a host
+    // without it reports the gap instead of failing a target it cannot build.
+    let compiled = Command::new(&cc)
+        .args([
+            "-m32",
+            "-O0",
+            "-g",
+            "-gdwarf-4",
+            "-fno-pie",
+            "-fno-eliminate-unused-debug-types",
+            "-c",
+        ])
+        .arg(PROBE_C)
+        .arg("-o")
+        .arg(&object)
+        .output();
+    match compiled {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "skipping 32-bit target: cc -m32 failed ({})",
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!("skipping 32-bit target: {error}");
+            return;
+        }
+    }
+    let binary = directory.join("probe32");
+    compile(
+        Command::new(&cc)
+            .arg(&object)
+            .args(["-m32", "-no-pie"])
+            .arg("-o")
+            .arg(&binary),
+    );
+    let oracle = Oracle::parse(&run_binary(&binary));
+    assert_eq!(oracle.pointer_size, 4, "the fixture must be 32-bit");
+    let output = directory.join("probe32.json");
+    let result = convert_binary(&binary, &output);
+    assert!(result.success(), "{}", result.describe());
+    let document = load_document(&output);
+    assert_eq!(
+        document["metadata"]["sym2isf"]["target"]["pointer_size"].as_u64(),
+        Some(4)
+    );
+    assert_probe_layout(&document, &oracle, "i386");
+}
+
+// ---------------------------------------------------------------------------
 // Relocations in a partially linked object
 // ---------------------------------------------------------------------------
 

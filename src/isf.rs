@@ -644,14 +644,12 @@ impl<'a> Validator<'a> {
             None => {}
         }
         self.states.insert(key.clone(), State::InProgress);
-        let result = (|| -> Result<()> {
-            match key {
-                DefKey::Base(name) => self.check_base(name),
-                DefKey::User(name) => self.check_user(name),
-                DefKey::Enum(name) => self.check_enum(name),
-                DefKey::Typedef(name) => self.check_typedef(name),
-            }
-        })();
+        let result = match key {
+            DefKey::Base(name) => self.check_base(name),
+            DefKey::User(name) => self.check_user(name),
+            DefKey::Enum(name) => self.check_enum(name),
+            DefKey::Typedef(name) => self.check_typedef(name),
+        };
         match result {
             Ok(()) => {
                 self.states.insert(key.clone(), State::Done);
@@ -767,26 +765,22 @@ impl<'a> Validator<'a> {
         // signatures break the chain and keep the recursion finite.
         let mut chain = vec![name.to_string()];
         let mut current = self.doc.typedefs[name].clone();
-        loop {
-            match &current {
-                TypeRef::Typedef { name: next, .. } => {
-                    if !self.doc.typedefs.contains_key(next) {
-                        return Err(Self::invalid(format!(
-                            "dangling reference to missing typedef `{next}`"
-                        )));
-                    }
-                    if chain.iter().any(|n| n == next) {
-                        chain.push(next.clone());
-                        return Err(Self::invalid(format!(
-                            "typedef alias cycle: {}",
-                            chain.join(" -> ")
-                        )));
-                    }
-                    chain.push(next.clone());
-                    current = self.doc.typedefs[next].clone();
-                }
-                _ => break,
+        while let TypeRef::Typedef { name: next, .. } = &current {
+            if !self.doc.typedefs.contains_key(next) {
+                return Err(Self::invalid(format!(
+                    "dangling reference to missing typedef `{next}`"
+                )));
             }
+            if chain.iter().any(|name| name == next) {
+                chain.push(next.clone());
+                return Err(Self::invalid(format!(
+                    "typedef alias cycle: {}",
+                    chain.join(" -> ")
+                )));
+            }
+            chain.push(next.clone());
+            let next = next.clone();
+            current = self.doc.typedefs[&next].clone();
         }
         self.check_ref(&current)
             .map_err(|e| Self::context(e, &format!("typedef `{name}`")))
