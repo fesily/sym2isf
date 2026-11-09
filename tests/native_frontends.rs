@@ -998,7 +998,13 @@ fn macho_objects_and_fat_architectures() {
     );
     assert_eq!(document["user_types"]["Bf"]["size"].as_u64(), Some(4));
 
-    let Some(lipo) = tool_any(&["llvm-lipo", "llvm-lipo-18"]) else {
+    // A universal-binary check needs `llvm-lipo`; some LLVM distributions (the
+    // Windows one) do not ship it, so its absence is reported, not fatal.
+    let Some(lipo) = ["llvm-lipo", "llvm-lipo-18", "llvm-lipo.exe"]
+        .iter()
+        .find_map(|name| find_tool(name))
+    else {
+        eprintln!("skipping: llvm-lipo is not available, fat containers unchecked");
         return;
     };
     let fat = directory.join("bf-fat.o");
