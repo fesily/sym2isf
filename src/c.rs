@@ -22,6 +22,8 @@ use crate::isf::{
     Qualifier, TypeRef, UserType,
 };
 
+mod ffi;
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -69,6 +71,34 @@ impl<'a> Request<'a> {
     }
 }
 
+/// Which declarations a LuaJIT FFI module should carry.
+///
+/// Selection follows [`Request`]: exact table keys, order-insensitive. A module
+/// names no library and computes no address, so there is no address-table or
+/// view choice here.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FfiRequest<'a> {
+    /// Root type names: keys of `base_types`, `user_types`, `enums` or `typedefs`.
+    pub types: &'a [&'a str],
+    /// Function names: keys of `functions`.
+    pub functions: &'a [&'a str],
+    /// Select every entry of `functions` instead of naming them.
+    pub all_functions: bool,
+    /// Allow an aggregate passed or returned by value.
+    pub allow_by_value_aggregates: bool,
+}
+
+/// Which renderer a prepared generator belongs to.
+///
+/// All three share one closure walk, one naming pass and one layout
+/// reconstruction; only the text they emit and the scalars they spell differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flavor {
+    Layout,
+    Sdk,
+    Ffi,
+}
+
 /// Render a self-contained C translation unit for one [`Request`].
 ///
 /// Every selected type must name exactly one entry of `base_types`,
@@ -76,6 +106,47 @@ impl<'a> Request<'a> {
 /// `functions`. The result is a pure function of the document and the request:
 /// the order in which names are given does not change the output.
 pub fn generate(document: &IsfDocument, request: &Request<'_>) -> Result<String> {
+    let flavor = match request.view {
+        View::Layout => Flavor::Layout,
+        View::Sdk => Flavor::Sdk,
+    };
+    prepare(document, request, flavor)?.emit()
+}
+
+/// Render a LuaJIT FFI module for one [`FfiRequest`].
+///
+/// The module carries `ffi.cdef` declarations, the ctype of every selected
+/// type, exact bit-field accessors and a binder that asks the caller's resolver
+/// for each address. It never loads the target module and never computes an
+/// address itself; the caller owns the module and the resolved pointers.
+pub fn generate_ffi(document: &IsfDocument, request: &FfiRequest<'_>) -> Result<String> {
+    // The FFI module spells its own scalars and never asks for an address table,
+    // so the shared preparation runs with the layout-shaped request and the
+    // flavour decides the rendering.
+    let inner = Request {
+        types: request.types,
+        functions: request.functions,
+        all_functions: request.all_functions,
+        with_addresses: false,
+        view: View::Layout,
+        allow_by_value_aggregates: request.allow_by_value_aggregates,
+    };
+    prepare(document, &inner, Flavor::Ffi)
+        .and_then(ffi::emit)
+        .map_err(|error| match error {
+            // Every shared failure already names the record it came from; only
+            // the product name in the message changes.
+            Error::CGeneration { location, detail } => Error::FfiGeneration { location, detail },
+            other => other,
+        })
+}
+
+/// Validate the request and build the shared model both renderers consume.
+fn prepare<'a>(
+    document: &'a IsfDocument,
+    request: &Request<'_>,
+    flavor: Flavor,
+) -> Result<Generator<'a>> {
     document.validate()?;
     let target = &document.metadata.sym2isf.target;
     if target.endian.is_big() {
@@ -179,10 +250,9 @@ pub fn generate(document: &IsfDocument, request: &Request<'_>) -> Result<String>
         walker.used,
         functions,
         request.with_addresses,
-        request.view,
+        flavor,
         request.allow_by_value_aggregates,
-    )?
-    .emit()
+    )
 }
 
 fn cg(loc: &Loc<'_>, detail: impl Into<String>) -> Error {
@@ -697,13 +767,12 @@ fn is_plain_identifier(name: &str) -> bool {
     !is_c_keyword(name)
 }
 
-fn field_identifier(original: &str, used: &mut BTreeSet<String>) -> String {
-    let candidate = if is_plain_identifier(original) {
-        original.to_string()
-    } else {
-        format!("s2c_f_{}", encode(original))
-    };
-    unique_name(used, &candidate)
+/// Names `ffi.cdef` reserves although C allows them.
+///
+/// `bool` and `complex` are predefined `ffi.cdef` typedefs, so a member with
+/// either spelling is rejected by the parser rather than shadowing them.
+fn is_cdef_keyword(name: &str) -> bool {
+    matches!(name, "bool" | "complex")
 }
 
 /// A parameter name, when the document records one that can be spelled in C.
@@ -808,6 +877,20 @@ struct AccessorNames {
     set: Option<String>,
 }
 
+/// One callable entry point, shared by the SDK header and the FFI module.
+struct ApiMember {
+    /// Table key of the function in `functions`.
+    source: String,
+    /// cdef identifier of the member.
+    identifier: String,
+    /// Declaration that names the member (`T (*name)(...)`).
+    declaration: String,
+    /// The same function pointer type without a name, for the cast.
+    cast: String,
+    /// Recorded offset, already relative to the image base.
+    rva: u64,
+}
+
 /// One member as the document records it, before placement.
 struct Entry {
     offset: u64,
@@ -842,7 +925,7 @@ struct Generator<'a> {
     functions: Vec<String>,
     function_names: BTreeMap<String, String>,
     with_addresses: bool,
-    view: View,
+    flavor: Flavor,
     image_base: Option<u64>,
     allow_by_value_aggregates: bool,
     /// Identifiers the header itself provides (`<stdint.h>` spellings, the guard
@@ -859,7 +942,7 @@ impl<'a> Generator<'a> {
         used: Used,
         functions: Vec<String>,
         with_addresses: bool,
-        request_view: View,
+        request_flavor: Flavor,
         request_by_value: bool,
     ) -> Result<Self> {
         let mut generator = Generator {
@@ -878,7 +961,7 @@ impl<'a> Generator<'a> {
             functions,
             function_names: BTreeMap::new(),
             with_addresses,
-            view: request_view,
+            flavor: request_flavor,
             image_base: doc.metadata.sym2isf.image_base,
             allow_by_value_aggregates: request_by_value,
             reserved: BTreeSet::new(),
@@ -892,12 +975,37 @@ impl<'a> Generator<'a> {
         generator.forbidden = generator.type_spellings();
         generator.compute_layouts()?;
         generator.order = generator.definition_order()?;
-        generator.assign_accessors();
+        // The FFI module reads the recorded slices directly and never calls a C
+        // accessor, so it does not allocate accessor names.
+        if generator.flavor != Flavor::Ffi {
+            generator.assign_accessors();
+        }
         Ok(generator)
     }
 
     fn unique(&mut self, candidate: &str) -> String {
         unique_name(&mut self.identifiers, candidate)
+    }
+
+    /// True when scalars are spelled with the standard fixed-width types.
+    fn uses_standard_scalars(&self) -> bool {
+        matches!(self.flavor, Flavor::Sdk | Flavor::Ffi)
+    }
+
+    /// The cdef identifier of one source member.
+    ///
+    /// The layout and SDK views keep a plain name when C can spell it; the FFI
+    /// module additionally avoids the spellings `ffi.cdef` reserves, because a
+    /// rejected declaration fails the whole module.
+    fn field_identifier(&self, original: &str, used: &mut BTreeSet<String>) -> String {
+        let plain = is_plain_identifier(original)
+            && !(self.flavor == Flavor::Ffi && is_cdef_keyword(original));
+        let candidate = if plain {
+            original.to_string()
+        } else {
+            format!("s2c_f_{}", encode(original))
+        };
+        unique_name(used, &candidate)
     }
 
     fn is_void_base(&self, name: &str) -> bool {
@@ -913,7 +1021,9 @@ impl<'a> Generator<'a> {
     /// document; emitting it under that name would collide with the includes, so
     /// those names are reserved and the encoded form is used instead.
     fn reserve_header_identifiers(&mut self) {
-        if self.view != View::Sdk {
+        // Both standard-spelling flavours must avoid stealing a spelling they
+        // emit themselves, whether as a type name or as an API member.
+        if !self.uses_standard_scalars() {
             return;
         }
         for name in [
@@ -941,7 +1051,7 @@ impl<'a> Generator<'a> {
 
     /// Every spelling the emitted declarations may use as a type.
     fn type_spellings(&self) -> BTreeSet<String> {
-        if self.view != View::Sdk {
+        if self.flavor != Flavor::Sdk {
             return BTreeSet::new();
         }
         let mut spellings: BTreeSet<String> = self.reserved.clone();
@@ -965,11 +1075,15 @@ impl<'a> Generator<'a> {
     fn assign_function_names(&mut self) -> BTreeMap<String, String> {
         let mut names = BTreeMap::new();
         for name in self.functions.clone() {
-            let spellable = match self.view {
-                View::Layout => is_spellable_identifier(&name),
+            let spellable = match self.flavor {
+                Flavor::Layout => is_spellable_identifier(&name),
                 // A struct member lives in its own scope, so the file-scope
                 // reserved forms (`_x`) are fine there.
-                View::Sdk => is_c_identifier(&name) && !self.reserved.contains(&name),
+                Flavor::Sdk | Flavor::Ffi => {
+                    is_c_identifier(&name)
+                        && !self.reserved.contains(&name)
+                        && !(self.flavor == Flavor::Ffi && is_cdef_keyword(&name))
+                }
             };
             let candidate = if spellable {
                 name.clone()
@@ -984,14 +1098,17 @@ impl<'a> Generator<'a> {
 
     /// The name to try for one declaration.
     ///
-    /// The layout view always prefixes (it must never collide with a source
-    /// name); the SDK view keeps a name C can spell so the header reads like the
-    /// original source, and falls back to the prefixed form.
+    /// The layout and FFI views always prefix (the FFI module must never take a
+    /// source name as a host ctype); the SDK view keeps a name C can spell so the
+    /// header reads like the original source, and falls back to the prefixed
+    /// form.
     fn candidate(&self, name: &str, prefix: &str) -> String {
-        match self.view {
-            View::Layout => format!("{prefix}{}", encode(name)),
-            View::Sdk if is_c_identifier(name) && !self.reserved.contains(name) => name.to_string(),
-            View::Sdk => format!("{prefix}{}", encode(name)),
+        match self.flavor {
+            Flavor::Layout | Flavor::Ffi => format!("{prefix}{}", encode(name)),
+            Flavor::Sdk if is_c_identifier(name) && !self.reserved.contains(name) => {
+                name.to_string()
+            }
+            Flavor::Sdk => format!("{prefix}{}", encode(name)),
         }
     }
 
@@ -1001,9 +1118,9 @@ impl<'a> Generator<'a> {
             if self.is_void_base(&name) {
                 continue;
             }
-            // The SDK view spells scalars with the standard fixed-width types, so
-            // only an opaque unit needs a name there.
-            if self.view == View::Sdk && self.doc.base_types[&name].kind != BaseKind::Opaque {
+            // The SDK and FFI views spell scalars with the standard fixed-width
+            // types, so only an opaque unit needs a name there.
+            if self.uses_standard_scalars() && self.doc.base_types[&name].kind != BaseKind::Opaque {
                 continue;
             }
             let candidate = self.candidate(&name, "s2c_b_");
@@ -1063,7 +1180,7 @@ impl<'a> Generator<'a> {
         let mut scope: BTreeSet<String> = BTreeSet::new();
         let mut field_identifiers: BTreeMap<String, String> = BTreeMap::new();
         for field in user.fields.keys() {
-            field_identifiers.insert(field.clone(), field_identifier(field, &mut scope));
+            field_identifiers.insert(field.clone(), self.field_identifier(field, &mut scope));
         }
         let alignment = check_alignment(user.alignment, user.size, name)?;
         let bitfields = self.bitfields(user, &field_identifiers);
@@ -1363,7 +1480,7 @@ impl<'a> Generator<'a> {
                     .ok_or_else(|| cg(loc, format!("missing base type `{name}`")))?;
                 let text = if base.kind == BaseKind::Void {
                     "void".to_string()
-                } else if self.view == View::Sdk && base.kind != BaseKind::Opaque {
+                } else if self.uses_standard_scalars() && base.kind != BaseKind::Opaque {
                     self.sdk_scalar(base, name)?
                 } else {
                     self.base_names.get(name).cloned().ok_or_else(|| {
@@ -1450,9 +1567,21 @@ impl<'a> Generator<'a> {
                 return_type,
                 parameters,
                 variadic,
+                calling_convention,
                 qualifiers,
-                ..
             } => {
+                // A function type reached through a field, an alias or a return
+                // value is still callable: the FFI module applies the same
+                // by-value and calling-convention rules the top-level entries get,
+                // instead of dropping the recorded convention.
+                if self.flavor == Flavor::Ffi {
+                    self.check_callable(
+                        return_type,
+                        parameters,
+                        calling_convention.as_deref(),
+                        loc,
+                    )?;
+                }
                 let (ret, rendered, variadic) = self.signature_parts(
                     return_type,
                     parameters,
@@ -1671,8 +1800,19 @@ impl<'a> Generator<'a> {
     // -----------------------------------------------------------------------
 
     fn emit(mut self) -> Result<String> {
+        let view = match self.flavor {
+            Flavor::Layout => View::Layout,
+            Flavor::Sdk => View::Sdk,
+            // `emit` is the C renderer; the FFI flavour has its own in `ffi`.
+            Flavor::Ffi => {
+                return Err(cg(
+                    &Loc::Roots,
+                    "the FFI module is rendered by the FFI emitter",
+                ));
+            }
+        };
         let mut out = String::new();
-        if self.view == View::Sdk {
+        if view == View::Sdk {
             line(&mut out, format_args!("#ifndef S2C_SDK_H"));
             line(&mut out, format_args!("#define S2C_SDK_H"));
             blank(&mut out);
@@ -1682,7 +1822,7 @@ impl<'a> Generator<'a> {
         self.emit_scalars(&mut out)?;
         self.emit_aggregates(&mut out)?;
         self.emit_aliases(&mut out)?;
-        match self.view {
+        match view {
             View::Layout => {
                 self.emit_prototypes(&mut out)?;
                 self.emit_addresses(&mut out)?;
@@ -1691,7 +1831,7 @@ impl<'a> Generator<'a> {
         }
         self.emit_assertions(&mut out)?;
         self.emit_accessors(&mut out)?;
-        if self.view == View::Sdk {
+        if view == View::Sdk {
             line(&mut out, format_args!("#endif /* S2C_SDK_H */"));
         }
         Ok(out)
@@ -1705,9 +1845,10 @@ impl<'a> Generator<'a> {
             out,
             format_args!(
                 "/* generated by sym2isf: {} view of an extended ISF document */",
-                match self.view {
-                    View::Layout => "layout",
-                    View::Sdk => "SDK",
+                if self.flavor == Flavor::Sdk {
+                    "SDK"
+                } else {
+                    "layout"
                 }
             ),
         );
@@ -1790,16 +1931,25 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_scalars(&mut self, out: &mut String) -> Result<()> {
+        self.emit_base_units(out)?;
+        self.emit_enums(out, true)?;
+        blank(out);
+        Ok(())
+    }
+
+    /// Every base unit the closure needs: a typedef for an opaque blob, and a
+    /// validation of the standard spelling for a scalar.
+    fn emit_base_units(&mut self, out: &mut String) -> Result<()> {
         let names: Vec<String> = self.used.scalars.iter().cloned().collect();
         for name in names {
             if self.is_void_base(&name) {
                 continue;
             }
             let base = &self.doc.base_types[&name];
-            if self.view == View::Sdk && base.kind != BaseKind::Opaque {
+            if self.uses_standard_scalars() && base.kind != BaseKind::Opaque {
                 // No typedef is emitted for a scalar, but a selected unit is
-                // still validated: a width, endian or alignment the SDK cannot
-                // spell must fail instead of being silently skipped.
+                // still validated: a width, endian or alignment the standard
+                // types cannot spell must fail instead of being skipped.
                 let _ = self.sdk_scalar(base, &name)?;
                 continue;
             }
@@ -1819,9 +1969,10 @@ impl<'a> Generator<'a> {
                     out,
                     format_args!("/* base type {name_text} is a byte blob: {reason} */"),
                 );
-                // The layout view keeps its historical anonymous struct; the SDK
-                // view names the tag so `struct Name` works as well as `Name`.
-                if self.view == View::Sdk {
+                // The layout view keeps its historical anonymous struct; the
+                // standard-spelling views name the tag so `struct Name` works as
+                // well as `Name`.
+                if self.uses_standard_scalars() {
                     line(
                         out,
                         format_args!(
@@ -1848,12 +1999,19 @@ impl<'a> Generator<'a> {
                 line(out, format_args!("typedef {text} {identifier}{attribute};"));
             }
         }
+        Ok(())
+    }
 
+    /// The fixed-width typedef of every used enum.
+    fn emit_enums(&mut self, out: &mut String, with_constants: bool) -> Result<()> {
         let enums: Vec<String> = self.used.enums.iter().cloned().collect();
         for name in enums {
-            self.emit_enum(&name, out)?;
+            if with_constants {
+                self.emit_enum(&name, out)?;
+            } else {
+                self.emit_enum_typedef(&name, out)?;
+            }
         }
-        blank(out);
         Ok(())
     }
 
@@ -1961,7 +2119,8 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn emit_enum(&mut self, name: &str, out: &mut String) -> Result<()> {
+    /// The fixed-width integer an enum becomes, and its signedness and width.
+    fn enum_layout(&self, name: &str) -> Result<(String, bool, u64)> {
         let enum_type = &self.doc.enums[name];
         let identifier = self.enum_names[name].clone();
         let loc = Loc::Type(name);
@@ -1996,7 +2155,12 @@ impl<'a> Generator<'a> {
                 ),
             ));
         }
-        let bits = enum_type.size * 8;
+        Ok((identifier, signed, enum_type.size * 8))
+    }
+
+    /// The enum declaration on its own: a fixed-width typedef, never a C `enum`.
+    fn emit_enum_typedef(&self, name: &str, out: &mut String) -> Result<()> {
+        let (identifier, signed, bits) = self.enum_layout(name)?;
         let name_text = comment_text(name);
         line(out, format_args!("/* enum {name_text} -> {identifier} */"));
         line(
@@ -2006,7 +2170,13 @@ impl<'a> Generator<'a> {
                 if signed { "int" } else { "uint" }
             ),
         );
-        let constants: Vec<(String, IntValue)> = enum_type
+        Ok(())
+    }
+
+    fn emit_enum(&mut self, name: &str, out: &mut String) -> Result<()> {
+        self.emit_enum_typedef(name, out)?;
+        let identifier = self.enum_names[name].clone();
+        let constants: Vec<(String, IntValue)> = self.doc.enums[name]
             .constants
             .iter()
             .map(|(key, value)| (key.clone(), *value))
@@ -2096,7 +2266,7 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_prototypes(&mut self, out: &mut String) -> Result<()> {
-        if self.view != View::Layout || self.functions.is_empty() {
+        if self.flavor != Flavor::Layout || self.functions.is_empty() {
             return Ok(());
         }
         line(
@@ -2135,12 +2305,22 @@ impl<'a> Generator<'a> {
     }
 
     /// Reject a signature the ABI-correct call path cannot express.
-    fn check_callable(&self, function: &IsfFunction, loc: &Loc<'_>) -> Result<()> {
+    ///
+    /// The same rule applies to a top-level function and to a function type
+    /// reached through a field, an alias or a return value: dropping a recorded
+    /// calling convention would silently turn it into the default one.
+    fn check_callable(
+        &self,
+        return_type: &TypeRef,
+        parameters: &[Parameter],
+        calling_convention: Option<&str>,
+        loc: &Loc<'_>,
+    ) -> Result<()> {
         // x86-64 has one integer/SSE convention; a 32-bit target has several and
         // the attribute for them is not emitted yet.
         if self.pointer_size == 4 {
-            if let Some(convention) = &function.calling_convention {
-                if !matches!(convention.as_str(), "near_cdecl" | "cdecl" | "none") {
+            if let Some(convention) = calling_convention {
+                if !matches!(convention, "near_cdecl" | "cdecl" | "none") {
                     return Err(cg(
                         loc,
                         format!("calling convention `{convention}` is not supported yet"),
@@ -2149,7 +2329,7 @@ impl<'a> Generator<'a> {
             }
         }
         if !self.allow_by_value_aggregates {
-            if let Some(aggregate) = self.by_value_aggregate(&function.return_type, 0) {
+            if let Some(aggregate) = self.by_value_aggregate(return_type, 0) {
                 return Err(cg(
                     loc,
                     format!(
@@ -2157,7 +2337,7 @@ impl<'a> Generator<'a> {
                     ),
                 ));
             }
-            for parameter in &function.parameters {
+            for parameter in parameters {
                 if let Some(aggregate) = self.by_value_aggregate(&parameter.ty, 0) {
                     return Err(cg(
                         loc,
@@ -2196,33 +2376,26 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// `struct s2c_api` of function pointers plus the binder that fills it.
+    /// One callable entry point: its source name, its cdef member identifier, the
+    /// declaration that names it, the cast type that does not, and its offset.
     ///
-    /// Nothing is linked: every member is looked up through the caller's
-    /// resolver by source name and recorded offset, so the header works for a
-    /// module at any load address.
-    fn emit_api(&mut self, out: &mut String) -> Result<()> {
-        if self.view != View::Sdk {
-            return Ok(());
-        }
-        if self.functions.is_empty() {
-            return Err(cg(
-                &Loc::Functions,
-                "the SDK view needs at least one selected function",
-            ));
-        }
-        struct Member {
-            source: String,
-            identifier: String,
-            declaration: String,
-            cast: String,
-            rva: u64,
-        }
-        let mut members: Vec<Member> = Vec::with_capacity(self.functions.len());
-        for name in self.functions.clone() {
-            let function: IsfFunction = self.doc.functions[&name].clone();
-            let loc = Loc::Function(&name);
-            self.check_callable(&function, &loc)?;
+    /// Both the SDK header and the FFI module bind from this, so the recorded
+    /// address, the image-base subtraction and the callable checks live once.
+    fn api_members(&self) -> Result<Vec<ApiMember>> {
+        // The SDK member renders like the source prototype, parameter names
+        // included, so the header reads like the original. FFI declarations name
+        // no parameter: `ffi.cdef` keeps none of them.
+        let named = self.flavor == Flavor::Sdk;
+        let mut members: Vec<ApiMember> = Vec::with_capacity(self.functions.len());
+        for name in &self.functions {
+            let function = &self.doc.functions[name];
+            let loc = Loc::Function(name);
+            self.check_callable(
+                &function.return_type,
+                &function.parameters,
+                function.calling_convention.as_deref(),
+                &loc,
+            )?;
             let (ret, parameters, variadic) = self.signature_parts(
                 &function.return_type,
                 &function.parameters,
@@ -2235,17 +2408,19 @@ impl<'a> Generator<'a> {
                 Box::new(CType::Function(Box::new(ret), parameters, variadic)),
                 Vec::new(),
             );
-            let identifier = self.function_names[&name].clone();
-            // The member renders like the source prototype, parameter names
-            // included, so the API reads like the original header.
-            let mut scope: BTreeSet<String> = BTreeSet::new();
-            let names: Vec<Option<String>> = function
-                .parameters
-                .iter()
-                .map(|parameter| {
-                    parameter_ident(parameter.name.as_deref(), &mut scope, &self.forbidden)
-                })
-                .collect();
+            let identifier = self.function_names[name].clone();
+            let names: Vec<Option<String>> = if named {
+                let mut scope: BTreeSet<String> = BTreeSet::new();
+                function
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        parameter_ident(parameter.name.as_deref(), &mut scope, &self.forbidden)
+                    })
+                    .collect()
+            } else {
+                vec![None; function.parameters.len()]
+            };
             let address = function
                 .address
                 .ok_or_else(|| cg(&loc, "no recorded address"))?;
@@ -2259,7 +2434,25 @@ impl<'a> Generator<'a> {
                 }
                 None => address,
             };
-            members.push(Member {
+            // A resolver hands the offset back as a `uintptr_t`, so an offset
+            // that does not fit one would reach the caller truncated.
+            if self.flavor == Flavor::Ffi {
+                let limit = if self.pointer_size == 4 {
+                    u64::from(u32::MAX)
+                } else {
+                    u64::MAX
+                };
+                if rva > limit {
+                    return Err(cg(
+                        &loc,
+                        format!(
+                            "offset {rva:#x} does not fit a {}-byte uintptr_t",
+                            self.pointer_size
+                        ),
+                    ));
+                }
+            }
+            members.push(ApiMember {
                 source: name.clone(),
                 declaration: declare_with_names(&pointer, &identifier, Some(&names)),
                 cast: declare(&pointer, ""),
@@ -2267,21 +2460,26 @@ impl<'a> Generator<'a> {
                 rva,
             });
         }
+        Ok(members)
+    }
 
-        let record = self.unique("s2c_api");
-        line(
-            out,
-            format_args!("/* every callable entry point, resolved at run time */"),
-        );
-        line(out, format_args!("struct {record} {{"));
-        for member in &members {
-            line(
-                out,
-                format_args!("    {}; /* {} */", member.declaration, member.identifier),
-            );
+    /// `struct s2c_api` of function pointers plus the binder that fills it.
+    ///
+    /// Nothing is linked: every member is looked up through the caller's
+    /// resolver by source name and recorded offset, so the header works for a
+    /// module at any load address.
+    fn emit_api(&mut self, out: &mut String) -> Result<()> {
+        if self.flavor != Flavor::Sdk {
+            return Ok(());
         }
-        line(out, format_args!("}};"));
-        line(out, format_args!("typedef struct {record} {record};"));
+        if self.functions.is_empty() {
+            return Err(cg(
+                &Loc::Functions,
+                "the SDK view needs at least one selected function",
+            ));
+        }
+        let members = self.api_members()?;
+        let record = self.emit_api_record(out, &members);
         blank(out);
         // Resolution is the caller's business: the header only states what it
         // needs (the source name and the recorded offset) and binds what the
@@ -2333,6 +2531,25 @@ impl<'a> Generator<'a> {
         line(out, format_args!("}}"));
         blank(out);
         Ok(())
+    }
+
+    /// The record itself: one typed function pointer per selected function.
+    fn emit_api_record(&mut self, out: &mut String, members: &[ApiMember]) -> String {
+        let record = self.unique("s2c_api");
+        line(
+            out,
+            format_args!("/* every callable entry point, resolved at run time */"),
+        );
+        line(out, format_args!("struct {record} {{"));
+        for member in members {
+            line(
+                out,
+                format_args!("    {}; /* {} */", member.declaration, member.identifier),
+            );
+        }
+        line(out, format_args!("}};"));
+        line(out, format_args!("typedef struct {record} {record};"));
+        record
     }
 
     fn emit_addresses(&mut self, out: &mut String) -> Result<()> {
@@ -2394,7 +2611,7 @@ impl<'a> Generator<'a> {
                 }
                 let base = &self.doc.base_types[&name];
                 // Only the units that got a typedef need an assertion here.
-                if self.view == View::Sdk && base.kind != BaseKind::Opaque {
+                if self.uses_standard_scalars() && base.kind != BaseKind::Opaque {
                     continue;
                 }
                 let identifier = self.base_names[&name].clone();
@@ -2450,9 +2667,10 @@ impl<'a> Generator<'a> {
     /// `static inline` in a header (an unused accessor must not warn), `static`
     /// in the compiled layout unit, whose bytes are part of the shipped output.
     fn accessor_linkage(&self) -> &'static str {
-        match self.view {
-            View::Layout => "static",
-            View::Sdk => "static inline",
+        if self.flavor == Flavor::Sdk {
+            "static inline"
+        } else {
+            "static"
         }
     }
 

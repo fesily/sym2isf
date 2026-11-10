@@ -6,7 +6,8 @@ extended ISF document format.
 It is a frontend only: it reads a debug container, normalizes the records it
 finds, and writes a JSON (or JSON.XZ) document that other tools consume. It can
 also render that document as C declarations — types and function signatures
-(`dwarf-c`, `pdb-c`) — which is a static memory layout view: the crate still contains no layout engine, no memory
+(`dwarf-c`, `pdb-c`) — or as a LuaJIT FFI module, which is a static memory
+layout view: the crate still contains no layout engine, no memory
 accessor and no virtual-machine bindings, it never executes or maps the target
 program, and it never falls back to Ghidra, a Python script or a downloaded
 symbol server.
@@ -18,27 +19,30 @@ sym2isf dwarf <image> --output <out.json|out.json.xz>
 sym2isf pdb <file.pdb> --output <out.json|out.json.xz>
     [--image <file.exe|file.dll>] [--image-base <decimal|0xhex>] [--types-only]
 
-sym2isf dwarf-c <image> --output <out.c|out.h>
+sym2isf dwarf-c <image> --output <out.c|out.h|out.lua>
     (--type <name> | --function <name>) ... [--all-functions] [--with-addresses]
-    [--emit <layout|sdk>] [--allow-by-value-aggregates]
-    [--tcc <executable>] [--debug-file <path>] [--architecture <arch>]
+    [--emit <layout|sdk|ffi>] [--allow-by-value-aggregates]
+    [--tcc <executable>] [--luajit <executable>]
+    [--debug-file <path>] [--architecture <arch>]
 
-sym2isf pdb-c <file.pdb> --output <out.c|out.h>
+sym2isf pdb-c <file.pdb> --output <out.c|out.h|out.lua>
     (--type <name> | --function <name>) ... [--all-functions] [--with-addresses]
-    [--emit <layout|sdk>] [--allow-by-value-aggregates]
-    [--tcc <executable>] [--image <file.exe>] [--image-base <decimal|0xhex>]
+    [--emit <layout|sdk|ffi>] [--allow-by-value-aggregates]
+    [--tcc <executable>] [--luajit <executable>]
+    [--image <file.exe>] [--image-base <decimal|0xhex>]
 ```
 
 Exit codes: `0` success, `2` bad arguments, `1` conversion, validation, generation,
 compilation or I/O failure. Standard output stays empty on success; the artifact is
 the only output of a successful run, and progress or failure is reported on stderr.
 
-`dwarf-c` and `pdb-c` read only the type information (no symbols, no functions,
-no address conversion) and publish the C source only after an external TCC
+`dwarf-c` and `pdb-c` publish the artifact only after an external checker
 accepted it: the translation unit is written to a private temporary directory,
-compiled with `tcc -Werror -c`, and only then created at `--output` with
-`create_new`. A missing compiler, a rejected unit or an existing output leaves no
-file behind.
+compiled with `tcc -Werror -c` (or, for `--emit ffi`, loaded by `--luajit` with
+`luajit module.lua`), and only then created at `--output` with `create_new`. The
+layout, SDK and FFI views read only the type information unless addresses are
+needed; the FFI module needs them only when functions are selected. A missing
+checker, a rejected artifact or an existing output leaves no file behind.
 
 ## C declarations
 
@@ -122,7 +126,76 @@ static inline void s2c_bind(struct s2c_api *api, s2c_resolver resolve)
   is not an ABI promise. `--allow-by-value-aggregates` emits it anyway.
 * A non-default calling convention on a 32-bit target is refused until the
   attribute is emitted; x86-64 has a single convention and ignores the name.
-* `--emit layout` (the default) is unchanged, including `--with-addresses`.
+* `--emit layout` (the default) is unchanged, including `--with-addresses`;
+  `--emit ffi` is a separate, purely additive product.
+
+### FFI module
+
+`--emit ffi` writes one Lua module instead of C. It is still declarations, not a
+translation unit: the module registers an `ffi.cdef` string, publishes the ctype
+of every selected type, and binds callable entries through a resolver the caller
+supplies. It never loads a library, never resolves a link name and never
+computes an address.
+
+```lua
+local M = require("sdk")
+
+M.cdef                                   -- the declarations this module registered
+M.types.base_types[name]                 -- ffi.typeof, including a used `void`
+M.types.user_types[name]                 -- ffi.typeof; incomplete types allowed
+M.types.enums[name]                      -- the fixed-width enum typedef
+M.types.typedefs[name]                   -- an alias
+M.fields[aggregate][source_member]       -- the cdef identifier of an ordinary member
+M.constants[enum][constant]              -- an integer cdata of the enum type
+M.bits[aggregate][bit_field].get(p)      -- int64_t/uint64_t cdata
+M.bits[aggregate][bit_field].set(p, v)   -- absent for a const bit-field
+M.functions[source_function]             -- { member, ctype, offset }
+M.api_type                               -- nil when no function was selected
+M.bind(resolve)                          -- the filled record; absent without functions
+```
+
+* Every table key is the document's own string, byte for byte. A name holding a
+  quote, a backslash, a newline, a NUL, non-ASCII text or `]]` stays data: it is
+  escaped in Lua and referenced only through a string subscript.
+* Type names are always prefixed (`s2c_s_`, `s2c_u_`, `s2c_b_`, `s2c_e_`,
+  `s2c_a_`), so an FFI module never occupies a source name in the host ctype
+  namespace. Scalars are spelled with the standard fixed-width types, exactly as
+  in the SDK view.
+* An enum is a fixed-width typedef; its constants are cast to that typedef, never
+  carried through a Lua number, so `int64_t` minima and `uint64_t` maxima survive.
+* Bit-fields are read and written through the recorded byte slices, never through
+  LuaJIT's own allocation rules: a field that starts mid-byte and spans nine bytes
+  keeps every neighbouring bit, and a `const` field has no setter.
+* `resolve(name, offset)` receives the source name and the recorded offset
+  (`image_base ? address - image_base : address`) as `uintptr_t` cdata. It must
+  return an address cdata or `nil`; a Lua number or a Lua function is refused,
+  because either would lose the address or silently allocate a callback. A `nil`
+  answer leaves the member `NULL`, and each call returns a fresh record.
+* Selecting a function requires its address, so a PDB needs `--image` or
+  `--image-base`; selecting types only does not, so an unlinked object works.
+  `--with-addresses` is a layout-view flag and is refused with `--emit ffi`.
+* The module refuses to load rather than mislead. Before registering anything it
+  checks the byte order, the pointer width and `ffi.arch` against the document
+  (`i386`→`x86`, `x86_64`→`x64`, `arm`→`arm`, `aarch64`→`arm64`,
+  `powerpc`→`ppc`, `mips`→`mips`/`mipsel`, `mips64`→`mips64`/`mips64el`/
+  `mips64r6`/`mips64r6el`); another architecture is refused at generation time.
+  It also refuses a name it would define that already exists, because LuaJIT keeps
+  an earlier typedef instead of replacing it. After `ffi.cdef` it asserts every
+  recorded size, every recorded alignment, the packed alignment it emitted, and
+  every member offset.
+* The FFI module carries no `extern`, no link name and no `dlsym`: the caller owns
+  the module handle, the resolver and the lifetime of everything it returns. The
+  target's OS, float ABI and calling convention remain the caller's
+  responsibility; the document records none of them, and a 32-bit non-default
+  calling convention is refused (top level or nested in a function type) rather
+  than silently made the default.
+* `--luajit` names the interpreter used to check the module and defaults to
+  `luajit` on `PATH`; a relative path resolves against the invoking directory. The
+  interpreter must match the target's architecture and pointer width, since that
+  is the check. `--tcc` applies to the layout and SDK views only. As with `--tcc`,
+  the gate is the named program's exit status: naming something that is not an
+  interpreter disables the check, so the product is only as verified as the tool
+  you point at.
 
 ## Output contract
 

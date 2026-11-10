@@ -176,6 +176,24 @@ pub enum Error {
         detail: String,
     },
 
+    /// A record cannot be rendered as LuaJIT FFI declarations.
+    #[error("cannot generate LuaJIT FFI for {location}: {detail}")]
+    FfiGeneration {
+        /// Root type, type, field or function the failure belongs to.
+        location: String,
+        /// Why the record cannot be expressed.
+        detail: String,
+    },
+
+    /// The LuaJIT interpreter rejected the generated module.
+    #[error("LuaJIT validation failed using {}: {detail}", executable.display())]
+    LuaJitCheck {
+        /// Interpreter executable that was invoked.
+        executable: PathBuf,
+        /// Exit status and captured output.
+        detail: String,
+    },
+
     /// Checked arithmetic failed while normalizing sizes or offsets.
     #[error("{location}: arithmetic overflow while computing {what}")]
     Overflow {
@@ -233,6 +251,8 @@ impl Error {
             Error::UnsupportedTarget { .. } => "UnsupportedTarget",
             Error::CGeneration { .. } => "CGeneration",
             Error::TccCompile { .. } => "TccCompile",
+            Error::FfiGeneration { .. } => "FfiGeneration",
+            Error::LuaJitCheck { .. } => "LuaJitCheck",
             Error::Overflow { .. } => "Overflow",
             Error::InvalidDocument(_) => "InvalidDocument",
             Error::Json(_) => "Json",

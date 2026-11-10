@@ -2486,6 +2486,22 @@ fn dwarf_c_tcc_round_trip() {
     assert_eq!(stdout, "layout-ok\n", "the consumer reported a mismatch");
 }
 
+/// A type name that carries every byte an embedded declaration could lose.
+#[cfg(target_os = "linux")]
+const WEIRD_TYPE_NAME: &str = "Weird]]]===]\"\\\n\0中文";
+
+/// A function name with the same hazards, plus the ones only a resolver sees.
+#[cfg(target_os = "linux")]
+const WEIRD_FUNCTION_NAME: &str = "call\"back\\slash\n\0中文]]]===]";
+
+/// Names that end with bracket bytes: they must stay ordinary table keys and
+/// comment text, with no part of them read as a bracket.
+#[cfg(target_os = "linux")]
+const CLOSING_BRACKET_NAME: &str = "Closes]=]";
+
+#[cfg(target_os = "linux")]
+const TRAILING_BRACKET_NAME: &str = "Trailing]";
+
 /// A document that only the generator can produce: hostile names, declarator
 /// precedence, zero-length arrays, a forward-only pointer target and bit-fields
 /// that start mid-byte and span nine bytes.
@@ -2599,6 +2615,27 @@ fn edge_document() -> IsfDocument {
     document
         .base_types
         .insert("__isf_bitsu8".to_string(), base(BaseKind::Int, 1, false));
+    // An opaque unit: published as a named byte blob with its recorded
+    // alignment, and used by value inside an aggregate.
+    document.base_types.insert(
+        "opaque_blob".to_string(),
+        BaseType {
+            kind: BaseKind::Opaque,
+            size: 8,
+            signed: false,
+            endian: Endian::Little,
+            alignment: Some(8),
+            unsupported_reason: Some("vector register".to_string()),
+        },
+    );
+    document.user_types.insert(
+        "HoldsOpaque".to_string(),
+        user(
+            CompositeKind::Struct,
+            8,
+            vec![("blob", field(0, reference("opaque_blob")))],
+        ),
+    );
 
     document.user_types.insert(
         "Outer::Thing".to_string(),
@@ -2882,6 +2919,79 @@ fn edge_document() -> IsfDocument {
             ],
         ),
     );
+    // A member spelling that `ffi.cdef` reserves although C allows it there.
+    document.user_types.insert(
+        "KeywordFields".to_string(),
+        user(
+            CompositeKind::Struct,
+            8,
+            vec![
+                ("bool", field(0, reference("int32_t"))),
+                ("complex", field(4, reference("int32_t"))),
+            ],
+        ),
+    );
+    // An alignment the packed layout would not give on its own.
+    document.user_types.insert(
+        "Aligned16".to_string(),
+        UserType {
+            kind: CompositeKind::Struct,
+            size: 16,
+            fields: BTreeMap::from([(
+                "bytes".to_string(),
+                field(0, array_of(16, reference("uint8_t"))),
+            )]),
+            alignment: Some(16),
+            incomplete: None,
+            unsupported_reason: None,
+        },
+    );
+    // A doubly qualified pointer: both qualifiers must reach the declaration,
+    // and the member must still be addressable.
+    document.user_types.insert(
+        "QualifiedPointer".to_string(),
+        user(
+            CompositeKind::Struct,
+            8,
+            vec![(
+                "pointer",
+                field(
+                    0,
+                    TypeRef::Pointer {
+                        subtype: Box::new(reference("int32_t")),
+                        size: None,
+                        qualifiers: vec![sym2isf::Qualifier::Const],
+                        reference_kind: None,
+                    },
+                ),
+            )],
+        ),
+    );
+    // A source name that must stay data: it never becomes generated code.
+    for name in [WEIRD_TYPE_NAME, CLOSING_BRACKET_NAME, TRAILING_BRACKET_NAME] {
+        document.user_types.insert(
+            name.to_string(),
+            user(
+                CompositeKind::Struct,
+                4,
+                vec![("value", field(0, reference("int32_t")))],
+            ),
+        );
+    }
+    // A function whose name is a Lua keyword, and one that is not spellable at
+    // all: both are bound by source name, never by a generated identifier.
+    for (index, name) in ["end", WEIRD_FUNCTION_NAME].into_iter().enumerate() {
+        document.functions.insert(
+            name.to_string(),
+            sym2isf::isf::Function {
+                address: Some(0x3000 + index as u64 * 0x1000),
+                return_type: reference("int32_t"),
+                parameters: Vec::new(),
+                variadic: None,
+                calling_convention: None,
+            },
+        );
+    }
     // A function whose return type needs parentheses in the declarator.
     document.functions.insert(
         "factory".to_string(),
@@ -2900,6 +3010,18 @@ fn edge_document() -> IsfDocument {
             parameters: Vec::new(),
             variadic: None,
             calling_convention: None,
+        },
+    );
+    // A signed 64-bit enum: its minimum must survive the literal exactly.
+    document.enums.insert(
+        "SignedWide".to_string(),
+        sym2isf::isf::EnumType {
+            size: 8,
+            base: Some("int64_t".to_string()),
+            constants: BTreeMap::from([
+                ("max".to_string(), IntValue::Signed(i64::MAX)),
+                ("min".to_string(), IntValue::Signed(i64::MIN)),
+            ]),
         },
     );
     document.enums.insert(
@@ -3652,4 +3774,1107 @@ fn pdb_c_sdk_offsets_are_relative_to_the_image_base() {
         !source.contains(&format!("(uintptr_t)0x{address:016x}ULL")),
         "the absolute address must not be passed: {source}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// LuaJIT FFI module: a real interpreter loads it and a real module is called
+// ---------------------------------------------------------------------------
+
+/// Run one C subcommand with an FFI selection, naming the checking interpreter.
+#[cfg(target_os = "linux")]
+fn ffi_args(
+    subcommand: &str,
+    input: &Path,
+    args: &[&OsStr],
+    output: &Path,
+    luajit: &Path,
+) -> CliOutput {
+    let mut argv: Vec<std::ffi::OsString> = vec![subcommand.into(), input.as_os_str().to_owned()];
+    argv.extend(args.iter().map(|value| value.to_os_string()));
+    argv.push("--output".into());
+    argv.push(output.as_os_str().to_owned());
+    argv.push("--luajit".into());
+    argv.push(luajit.as_os_str().to_owned());
+    cli(argv)
+}
+
+/// Run a Lua script in `directory`, with the generated module on `package.path`.
+#[cfg(target_os = "linux")]
+fn luajit_output(luajit: &Path, directory: &Path, source: &str, args: &[&OsStr]) -> CliOutput {
+    static SCRIPT_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let index = SCRIPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let script = directory.join(format!("script-{index}.lua"));
+    std::fs::write(&script, source).expect("lua script");
+    let output = Command::new(luajit)
+        .arg(&script)
+        .args(args)
+        // The default path stays in place for `require("ffi")`; the scratch
+        // directory is searched first so `require("module")` finds the product.
+        .env("LUA_PATH", "./?.lua;;")
+        .current_dir(directory)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", luajit.display()));
+    CliOutput {
+        status: output.status.code(),
+        stdout: output.stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+/// Run a Lua script that must succeed, and return its standard output.
+#[cfg(target_os = "linux")]
+fn luajit_run(luajit: &Path, directory: &Path, source: &str, args: &[&OsStr]) -> String {
+    let output = luajit_output(luajit, directory, source, args);
+    assert!(
+        output.success(),
+        "LuaJIT rejected the script: {}",
+        output.describe()
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Lua expectations taken from the probe's own oracle.
+///
+/// The module is compared against what the compiler laid out, not against the
+/// values the module itself asserts.
+#[cfg(target_os = "linux")]
+fn ffi_expectations(oracle: &Oracle) -> String {
+    let mut source = String::new();
+    // Both the checks below and the caller's script share these locals.
+    source.push_str("local ffi = require(\"ffi\")\nlocal failures = 0\n");
+    source.push_str("local expected_sizes = {");
+    for (name, size) in &oracle.sizes {
+        source.push_str(&format!(" [{name:?}] = {size},"));
+    }
+    source.push_str(" }\n");
+    source.push_str("local expected_offsets = {\n");
+    for (aggregate, members) in &oracle.offsets {
+        source.push_str(&format!("  [{aggregate:?}] = {{"));
+        for (member, offset) in members {
+            source.push_str(&format!(" [{member:?}] = {offset},"));
+        }
+        source.push_str(" },\n");
+    }
+    source.push_str("}\n");
+    let bits: Vec<String> = oracle
+        .bits_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    source.push_str(&format!("local expected_bits = \"{}\"\n", bits.concat()));
+    for (name, value) in &oracle.bits_values {
+        source.push_str(&format!("local expected_{name} = {value}\n"));
+    }
+    source.push_str(FFI_LAYOUT_CHECKS);
+    source
+}
+
+/// Checks every selected aggregate against the oracle above.
+#[cfg(target_os = "linux")]
+const FFI_LAYOUT_CHECKS: &str = r#"
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+
+local function check_layout(M)
+  for name, size in pairs(expected_sizes) do
+    check(ffi.sizeof(M.types.user_types[name]) == size, "sizeof(" .. name .. ")")
+  end
+  for name, members in pairs(expected_offsets) do
+    for member, offset in pairs(members) do
+      local identifier = M.fields[name][member]
+      check(type(identifier) == "string", "M.fields[" .. name .. "][" .. member .. "]")
+      check(ffi.offsetof(M.types.user_types[name], identifier) == offset,
+        "offsetof(" .. name .. "." .. member .. ")")
+    end
+  end
+  -- The union overlays at zero, and the matrix really is 2x3 uint16_t.
+  for _, member in pairs({"word", "bytes"}) do
+    check(ffi.offsetof(M.types.user_types.Value, M.fields.Value[member]) == 0,
+      "Value." .. member)
+  end
+  local packet = M.types.user_types.Packet
+  check(ffi.offsetof(packet, M.fields.Packet.code) - ffi.offsetof(packet, M.fields.Packet.matrix) == 12,
+    "matrix occupies 2x3 uint16_t")
+  -- A packed aggregate keeps byte alignment.
+  check(ffi.alignof(M.types.user_types.Packed) == 1, "Packed alignment")
+end
+
+local function check_bits(M)
+  local bits = ffi.new(M.types.user_types.Bits)
+  M.bits.Bits.pad.set(bits, expected_pad)
+  M.bits.Bits.field.set(bits, expected_field)
+  M.bits.Bits.tail.set(bits, expected_tail)
+  check(M.bits.Bits.pad.get(bits) == expected_pad, "Bits.pad")
+  check(M.bits.Bits.field.get(bits) == expected_field, "Bits.field")
+  check(M.bits.Bits.tail.get(bits) == expected_tail, "Bits.tail")
+  local raw = ffi.cast("uint8_t *", bits)
+  local hex = {}
+  for index = 0, ffi.sizeof(M.types.user_types.Bits) - 1 do
+    hex[#hex + 1] = string.format("%02x", raw[index])
+  end
+  check(table.concat(hex) == expected_bits, "bit-field bytes " .. table.concat(hex))
+  -- The accessors take the aggregate or a pointer to it.
+  check(M.bits.Bits.tail.get(ffi.cast("void *", bits)) == expected_tail,
+    "a pointer works as well as a value")
+end
+"#;
+
+/// `dwarf-c --emit ffi` on a shared object, consumed by a real LuaJIT.
+///
+/// The consumer opens the module with dlopen, takes the load bias from an
+/// exported symbol and calls the two static functions through the generated
+/// record: the address arithmetic lives in the caller, never in the module.
+#[cfg(target_os = "linux")]
+#[test]
+fn dwarf_ffi_round_trip() {
+    let Some(cc) = tool("cc") else { return };
+    let Some(luajit) = tool("luajit") else { return };
+    let directory = tempdir("dwarf-ffi");
+    let library = build_shared_probe(&directory, &cc);
+    let binary = build_host_probe(&directory, &cc, "oracle", &["-gdwarf-4"]);
+    let oracle = Oracle::parse(&run_binary(&binary));
+
+    let module = directory.join("module.lua");
+    let result = ffi_args(
+        "dwarf-c",
+        &library,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            OsStr::new("--type"),
+            OsStr::new("Bits"),
+            OsStr::new("--type"),
+            OsStr::new("Packed"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--function"),
+            OsStr::new("endian_name"),
+        ],
+        &module,
+        &luajit,
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(
+        result.stdout.is_empty(),
+        "the artifact is the only output: {}",
+        result.describe()
+    );
+    assert!(module.is_file(), "the checked module is published");
+
+    let mut source = ffi_expectations(&oracle);
+    source.push_str(FFI_DWARF_CONSUMER);
+    let printed = luajit_run(&luajit, &directory, &source, &[library.as_os_str()]);
+    assert_eq!(printed, "ffi-ok\n", "the FFI consumer reported a mismatch");
+}
+
+/// Opens the target module and calls it through the generated declarations.
+#[cfg(target_os = "linux")]
+const FFI_DWARF_CONSUMER: &str = r#"
+-- An unrelated definition of a source name proves the module never takes one as
+-- a host ctype: the prefixed types stand beside it.
+ffi.cdef[[ struct Packet { int placeholder; }; ]]
+
+local M = require("module")
+check(require("module") == M, "require returns the same module once")
+check_layout(M)
+check_bits(M)
+-- `#` is meaningless on a hash-keyed table, so count the aliases directly.
+local aliases = 0
+for _ in pairs(M.types.typedefs) do aliases = aliases + 1 end
+check(aliases > 0, "the DWARF document publishes its aliases")
+
+ffi.cdef[[
+typedef struct { const char *dli_fname; void *dli_fbase; const char *dli_sname; void *dli_saddr; } Dl_info;
+void *dlopen(const char *filename, int flags);
+void *dlsym(void *handle, const char *symbol);
+int dladdr(void *addr, Dl_info *info);
+]]
+local dl = ffi.load("libdl.so.2")
+local handle = dl.dlopen(arg[1], 2) -- RTLD_NOW
+check(handle ~= nil, "dlopen")
+local anchor = dl.dlsym(handle, "packet_global")
+check(anchor ~= nil, "dlsym")
+local info = ffi.new("Dl_info")
+check(dl.dladdr(anchor, info) ~= 0, "dladdr")
+local base = ffi.cast("uintptr_t", info.dli_fbase)
+
+local seen = {}
+local api = M.bind(function(name, offset)
+  seen[name] = true
+  return ffi.cast("void *", base + offset)
+end)
+check(seen.packet_callback and seen.endian_name, "the resolver saw both source names")
+check(api[M.functions.packet_callback.member] ~= nil, "packet_callback is bound")
+
+local packet = ffi.new(M.types.user_types.Packet)
+packet[M.fields.Packet.value] = 5
+local result = api[M.functions.packet_callback.member](packet, 3)
+check(result == 8, "packet_callback returned " .. tostring(result))
+check(packet[M.fields.Packet.value] == 8, "packet_callback wrote through the pointer")
+check(ffi.string(api[M.functions.endian_name.member]()) == "little", "endian_name")
+
+-- A second binding knows nothing: a nil answer leaves the member NULL, and the
+-- first record keeps working.
+local empty = M.bind(function() return nil end)
+check(empty[M.functions.packet_callback.member] == nil, "nil leaves the member NULL")
+check(api[M.functions.packet_callback.member] ~= nil, "bindings are independent")
+
+-- The resolver contract is checked, not assumed.
+for _, answer in pairs({4096, function() end}) do
+  local ok, err = pcall(M.bind, function() return answer end)
+  check(not ok and tostring(err):find("resolver must return address cdata or nil", 1, true),
+    "resolver contract: " .. tostring(err))
+end
+local ok, err = pcall(M.bind, function() error("resolver exploded") end)
+check(not ok and tostring(err):find("resolver exploded", 1, true), "resolver errors propagate")
+
+if failures == 0 then
+  io.write("ffi-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+/// A Lua string literal that keeps every byte, for names that are data.
+#[cfg(target_os = "linux")]
+fn lua_literal(text: &str) -> String {
+    let mut literal = String::from("\"");
+    for byte in text.bytes() {
+        match byte {
+            b'"' => literal.push_str("\\\""),
+            b'\\' => literal.push_str("\\\\"),
+            0x20..=0x7e => literal.push(byte as char),
+            other => literal.push_str(&format!("\\{other:03}")),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+/// Write one generated module into the scratch directory.
+#[cfg(target_os = "linux")]
+fn write_lua(directory: &Path, name: &str, source: &str) {
+    std::fs::write(directory.join(format!("{name}.lua")), source).expect("lua module");
+}
+
+/// A document with one function at a chosen absolute address.
+#[cfg(target_os = "linux")]
+fn ffi_function_document(
+    architecture: &str,
+    pointer_size: u64,
+    image_base: Option<u64>,
+    address: u64,
+) -> IsfDocument {
+    use sym2isf::{
+        BaseKind, BaseType, CompositeKind, Endian, Field, Function, Target, TypeRef, UserType,
+    };
+    let base = |kind: BaseKind, size: u64, signed: bool| BaseType {
+        kind,
+        size,
+        signed,
+        endian: Endian::Little,
+        alignment: None,
+        unsupported_reason: None,
+    };
+    let mut document = IsfDocument::empty(
+        Target {
+            architecture: architecture.to_string(),
+            pointer_size,
+            endian: Endian::Little,
+        },
+        image_base,
+    );
+    document
+        .base_types
+        .insert("void".to_string(), base(BaseKind::Void, 0, false));
+    document
+        .base_types
+        .insert("int32_t".to_string(), base(BaseKind::Int, 4, true));
+    document.user_types.insert(
+        "Holder".to_string(),
+        UserType {
+            kind: CompositeKind::Struct,
+            size: 4,
+            fields: std::collections::BTreeMap::from([(
+                "value".to_string(),
+                Field {
+                    offset: 0,
+                    ty: TypeRef::Base {
+                        name: "int32_t".to_string(),
+                        qualifiers: Vec::new(),
+                    },
+                    anonymous: None,
+                },
+            )]),
+            alignment: None,
+            incomplete: None,
+            unsupported_reason: None,
+        },
+    );
+    document.functions.insert(
+        "far".to_string(),
+        Function {
+            address: Some(address),
+            return_type: TypeRef::Base {
+                name: "int32_t".to_string(),
+                qualifiers: Vec::new(),
+            },
+            parameters: Vec::new(),
+            variadic: None,
+            calling_convention: None,
+        },
+    );
+    document
+}
+
+/// `pdb-c --emit ffi`: the layout comes from the PDB, the offsets stay relative.
+///
+/// Nothing executes Windows code here: the module is loaded by the host LuaJIT
+/// to prove the declarations and the layout, and the resolver only checks the
+/// offset it is handed.
+#[cfg(target_os = "linux")]
+#[test]
+fn pdb_ffi_round_trip() {
+    let Some(artifacts) = pdb_artifacts() else {
+        return;
+    };
+    let Some(luajit) = tool("luajit") else { return };
+    let pdb = artifacts.join("probe.pdb");
+    let image = artifacts.join("probe.exe");
+    let oracle = Oracle::parse(
+        &std::fs::read_to_string(artifacts.join("oracle.json")).expect("oracle.json"),
+    );
+    let directory = tempdir("pdb-ffi");
+
+    let module = directory.join("module.lua");
+    let result = ffi_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            OsStr::new("--type"),
+            OsStr::new("Bits"),
+            OsStr::new("--type"),
+            OsStr::new("Packed"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--image"),
+            image.as_os_str(),
+        ],
+        &module,
+        &luajit,
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(result.stdout.is_empty(), "{}", result.describe());
+
+    // The fixture is linked at a fixed base, so the offset is the recorded
+    // address minus it; the resolver answers with nil and never calls anything.
+    const FIXTURE_BASE: u64 = 0x1_4000_0000;
+    let offset = oracle.addresses["packet_callback"] - FIXTURE_BASE;
+    let mut source = ffi_expectations(&oracle);
+    source.push_str(&format!("local expected_offset = {offset}\n"));
+    source.push_str(FFI_PDB_CONSUMER);
+    let printed = luajit_run(&luajit, &directory, &source, &[]);
+    assert_eq!(printed, "pdb-ffi-ok\n");
+
+    // Types only: no image and no base, so the module carries no binder.
+    let types_only = directory.join("types_only.lua");
+    let result = ffi_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packed"),
+        ],
+        &types_only,
+        &luajit,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let printed = luajit_run(&luajit, &directory, FFI_TYPES_ONLY_CONSUMER, &[]);
+    assert_eq!(printed, "types-only-ok\n");
+
+    // The same for an unlinked DWARF object: no addresses, so no function.
+    let Some(cc) = tool("cc") else { return };
+    let object = directory.join("probe.o");
+    compile(
+        Command::new(&cc)
+            .args(["-O0", "-g", "-gdwarf-4", "-fPIC", "-c"])
+            .arg(PROBE_C)
+            .arg("-o")
+            .arg(&object),
+    );
+    let dwarf_types = directory.join("dwarf_types.lua");
+    let result = ffi_args(
+        "dwarf-c",
+        &object,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packed"),
+        ],
+        &dwarf_types,
+        &luajit,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let printed = luajit_run(&luajit, &directory, FFI_DWARF_TYPES_CONSUMER, &[]);
+    assert_eq!(printed, "types-only-ok\n");
+}
+
+/// The PDB consumer: layout, bit-fields, and the offset the binder hands over.
+#[cfg(target_os = "linux")]
+const FFI_PDB_CONSUMER: &str = r#"
+local M = require("module")
+check_layout(M)
+check_bits(M)
+
+local offsets = {}
+local api = M.bind(function(name, offset)
+  offsets[name] = tonumber(offset)
+  return nil
+end)
+check(offsets.packet_callback == expected_offset, "packet_callback offset " .. tostring(offsets.packet_callback))
+check(api[M.functions.packet_callback.member] == nil, "a nil resolver leaves the member NULL")
+check(ffi.istype(M.api_type, api), "bind returns the declared record")
+
+if failures == 0 then
+  io.write("pdb-ffi-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+/// A types-only module: the declarations are there, the binder is not.
+#[cfg(target_os = "linux")]
+const FFI_TYPES_ONLY_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+local M = require("types_only")
+check(M.api_type == nil, "no API record without functions")
+check(M.bind == nil, "no binder without functions")
+local next_keys = 0
+for _ in pairs(M.functions) do next_keys = next_keys + 1 end
+check(next_keys == 0, "no functions were selected")
+local packed = M.types.user_types.Packed
+check(ffi.sizeof(packed) == 5, "Packed size")
+check(ffi.offsetof(packed, M.fields.Packed.value) == 1, "Packed.value offset")
+check(ffi.alignof(packed) == 1, "Packed alignment")
+if failures == 0 then
+  io.write("types-only-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+/// The DWARF types-only module, loaded from an unlinked object.
+#[cfg(target_os = "linux")]
+const FFI_DWARF_TYPES_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+local M = require("dwarf_types")
+check(M.api_type == nil and M.bind == nil, "an unlinked object has no binder")
+local packed = M.types.user_types.Packed
+check(ffi.sizeof(packed) == 5 and ffi.offsetof(packed, M.fields.Packed.value) == 1,
+  "Packed layout")
+if failures == 0 then
+  io.write("types-only-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+/// The edge document as a LuaJIT module: hostile names, 64-bit bit-fields,
+/// declarator precedence and the target checks.
+#[cfg(target_os = "linux")]
+#[test]
+fn ffi_generation_luajit_edges() {
+    use sym2isf::c::{FfiRequest, generate_ffi};
+
+    let Some(luajit) = tool("luajit") else { return };
+    let directory = tempdir("ffi-edges");
+    let document = edge_document();
+    let roots = [
+        "Outer::Thing",
+        "Outer_3a_3aThing",
+        "Edge",
+        "ZeroUnion",
+        "SignedBits64",
+        "UnsignedBits64",
+        "ConstVolatile",
+        "Wide",
+        "SignedWide",
+        "Factory",
+        "A",
+        "A2",
+        "KeywordFields",
+        "Aligned16",
+        WEIRD_TYPE_NAME,
+        CLOSING_BRACKET_NAME,
+        TRAILING_BRACKET_NAME,
+        "HoldsOpaque",
+        "QualifiedPointer",
+    ];
+    // `factory` has no address and stays out: a callable entry needs one.
+    let functions = ["end", WEIRD_FUNCTION_NAME];
+    let module = generate_ffi(
+        &document,
+        &FfiRequest {
+            types: &roots,
+            functions: &functions,
+            ..FfiRequest::default()
+        },
+    )
+    .expect("the edge document is describable as FFI");
+    write_lua(&directory, "module", &module);
+
+    let mut source = String::new();
+    source.push_str(&format!(
+        "local weird_type = {}\nlocal weird_function = {}\nlocal closing_bracket = {}\nlocal trailing_bracket = {}\n",
+        lua_literal(WEIRD_TYPE_NAME),
+        lua_literal(WEIRD_FUNCTION_NAME),
+        lua_literal(CLOSING_BRACKET_NAME),
+        lua_literal(TRAILING_BRACKET_NAME)
+    ));
+    source.push_str(FFI_EDGE_CONSUMER);
+    let printed = luajit_run(&luajit, &directory, &source, &[]);
+    assert_eq!(printed, "edges-ok\n");
+
+    // A second copy of the same module is refused before it registers anything.
+    let printed = luajit_run(&luajit, &directory, FFI_DUPLICATE_CONSUMER, &[]);
+    assert_eq!(printed, "duplicate-ok\n");
+
+    // A name the host already gave a different meaning is refused too.
+    let printed = luajit_run(&luajit, &directory, FFI_PREDEFINED_CONSUMER, &[]);
+    assert_eq!(printed, "predefined-ok\n");
+
+    // The record's tag is a separate name, defined before its typedef.
+    let printed = luajit_run(&luajit, &directory, FFI_PREDEFINED_TAG_CONSUMER, &[]);
+    assert_eq!(printed, "predefined-tag-ok\n");
+
+    // A 64-bit offset reaches the resolver exactly, with no double in between.
+    // The base is subtracted exactly, without a double in between.
+    let wide = ffi_function_document("x86_64", 8, Some(0x1_4000_0000), 0x20_0001_4000_0001);
+    let wide_module = generate_ffi(
+        &wide,
+        &FfiRequest {
+            functions: &["far"],
+            ..FfiRequest::default()
+        },
+    )
+    .expect("a 64-bit offset is representable");
+    write_lua(&directory, "wide", &wide_module);
+    let printed = luajit_run(&luajit, &directory, FFI_WIDE_OFFSET_CONSUMER, &[]);
+    assert_eq!(printed, "wide-ok\n");
+
+    // A 32-bit target cannot be checked by a 64-bit interpreter.
+    let narrow = ffi_function_document("i386", 4, None, 0x1000);
+    let narrow_module = generate_ffi(
+        &narrow,
+        &FfiRequest {
+            types: &["Holder"],
+            ..FfiRequest::default()
+        },
+    )
+    .expect("a 32-bit module is generated");
+    write_lua(&directory, "narrow", &narrow_module);
+    let printed = luajit_run(&luajit, &directory, FFI_NARROW_CONSUMER, &[]);
+    assert_eq!(printed, "narrow-ok\n");
+}
+
+/// The consuming half of the edge document.
+#[cfg(target_os = "linux")]
+const FFI_EDGE_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local bit = require("bit")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+
+local M = require("module")
+
+-- Member spellings `ffi.cdef` reserves are encoded, and still read and write.
+local keywords = ffi.new(M.types.user_types.KeywordFields)
+local bool_id = M.fields.KeywordFields["bool"]
+local complex_id = M.fields.KeywordFields["complex"]
+check(type(bool_id) == "string" and bool_id ~= "bool", "bool member is encoded")
+check(type(complex_id) == "string" and complex_id ~= "complex", "complex member is encoded")
+keywords[bool_id] = 7
+keywords[complex_id] = 11
+check(keywords[bool_id] == 7, "bool member reads back")
+check(keywords[complex_id] == 11, "complex member reads back")
+
+-- A 64-bit bit-field that starts mid-byte spans nine bytes; the neighbours keep
+-- every bit the field does not own.
+local signed_bits = ffi.new(M.types.user_types.SignedBits64)
+local unsigned_bits = ffi.new(M.types.user_types.UnsignedBits64)
+local signed_raw = ffi.cast("uint8_t *", signed_bits)
+local unsigned_raw = ffi.cast("uint8_t *", unsigned_bits)
+local i64_min = ffi.cast("int64_t", -9223372036854775808)
+local u64_max = 18446744073709551615ULL
+local function prefill(raw)
+  for index = 0, 8 do raw[index] = 0xa5 end
+end
+local function neighbours(raw)
+  return bit.band(raw[0], 0x07) == 0x05 and bit.rshift(raw[8], 3) == 0x14
+end
+for _, case in ipairs({
+  { 0, 0 },
+  { 1, 1 },
+  { u64_max, -1 },
+  { -1, -1 },
+  { i64_min, i64_min },
+}) do
+  prefill(signed_raw)
+  M.bits.SignedBits64.value.set(signed_bits, case[1])
+  check(M.bits.SignedBits64.value.get(signed_bits) == case[2],
+    "SignedBits64 value " .. tostring(M.bits.SignedBits64.value.get(signed_bits)))
+  check(neighbours(signed_raw), "SignedBits64 keeps its neighbour bits")
+end
+for _, case in ipairs({
+  { 0, 0 },
+  { 1, 1 },
+  { u64_max, u64_max },
+  { -1, u64_max },
+}) do
+  prefill(unsigned_raw)
+  M.bits.UnsignedBits64.value.set(unsigned_bits, case[1])
+  check(M.bits.UnsignedBits64.value.get(unsigned_bits) == case[2],
+    "UnsignedBits64 value " .. tostring(M.bits.UnsignedBits64.value.get(unsigned_bits)))
+  check(neighbours(unsigned_raw), "UnsignedBits64 keeps its neighbour bits")
+end
+
+-- A const field has no setter, and reading it leaves the record untouched.
+local guarded = ffi.new(M.types.user_types.ConstVolatile)
+local guarded_raw = ffi.cast("uint8_t *", guarded)
+guarded_raw[0] = 0xab
+guarded_raw[1] = 0x5a
+check(M.bits.ConstVolatile.keep.set == nil, "a const bit-field has no setter")
+check(M.bits.ConstVolatile.keep.get(guarded) == 0x0b, "const bit-field reads its nibble")
+check(guarded_raw[0] == 0xab and guarded_raw[1] == 0x5a, "reading writes nothing")
+
+-- 64-bit enum constants stay exact.
+check(M.constants.Wide[""] == 0, "the unnamed constant is zero")
+check(M.constants.Wide.empty == 1, "empty constant")
+check(M.constants.Wide.max == u64_max, "the widest constant")
+check(ffi.sizeof(M.types.enums.Wide) == 8, "Wide width")
+check(M.constants.SignedWide.min == i64_min, "the signed minimum")
+-- Written as a 64-bit literal: a Lua number cannot hold this value.
+check(M.constants.SignedWide.max == 9223372036854775807LL, "the signed maximum")
+check(ffi.sizeof(M.types.enums.SignedWide) == 8, "SignedWide width")
+
+-- An explicit alignment survives the packed layout, queried independently.
+check(ffi.alignof(M.types.user_types.Aligned16) == 16, "explicit alignment")
+check(ffi.sizeof(M.types.user_types.Aligned16) == 16, "aligned size")
+
+-- An opaque unit is a named byte blob with its recorded alignment.
+local opaque = M.types.base_types.opaque_blob
+check(opaque ~= nil, "an opaque unit is published")
+check(ffi.sizeof(opaque) == 8, "opaque width")
+check(ffi.alignof(opaque) == 8, "opaque alignment")
+local holder = ffi.new(M.types.user_types.HoldsOpaque)
+local holder_raw = ffi.cast("uint8_t *", holder)
+holder_raw[3] = 0x5a
+check(holder_raw[3] == 0x5a, "the blob is addressable storage")
+check(ffi.sizeof(M.types.user_types.HoldsOpaque) == 8, "an aggregate holding it stays packed")
+
+-- A qualified member keeps its qualifiers and stays addressable: `int32_t *const`
+-- is initialised once and cannot be written afterwards.
+local qualified_member = M.fields.QualifiedPointer.pointer
+check(type(qualified_member) == "string", "the qualified member has an identifier")
+check(ffi.offsetof(M.types.user_types.QualifiedPointer, qualified_member) == 0,
+  "the qualified member is at offset zero")
+local target = ffi.new("int32_t[1]", 42)
+local qualified = ffi.new(M.types.user_types.QualifiedPointer,
+  { [qualified_member] = ffi.cast("int32_t *", target) })
+check(qualified[qualified_member][0] == 42, "the qualified member reads through the pointer")
+check(not pcall(function() qualified[qualified_member] = nil end),
+  "a const pointer member cannot be reassigned")
+
+-- Declarator precedence: pointer to array, array of function pointers, nested
+-- member, and an alias taken by value.
+local edge = ffi.new(M.types.user_types.Edge)
+local values = ffi.new("int32_t[3]", 10, 20, 30)
+local array_pointer = ffi.cast("int32_t (*)[3]", values)
+edge[M.fields.Edge.array_pointer] = array_pointer
+-- `int32_t (*)[3]` is a pointer: the array is reached through element zero.
+check(edge[M.fields.Edge.array_pointer][0][2] == 30, "pointer to array of three")
+local rejected = pcall(function() edge[M.fields.Edge.array_pointer] = values end)
+check(not rejected, "a plain int32_t * is not a pointer to an array")
+
+local plus_one = ffi.cast("int32_t (*)(int32_t)", function(value) return value + 1 end)
+local callbacks = edge[M.fields.Edge.callbacks]
+callbacks[0] = plus_one
+check(callbacks[0](6) == 7, "array of function pointers")
+
+edge[M.fields.Edge.left][M.fields["Outer::Thing"]["int"]] = 7
+check(edge[M.fields.Edge.left][M.fields["Outer::Thing"]["int"]] == 7, "nested aggregate")
+edge[M.fields.Edge.right][M.fields.Outer_3a_3aThing["9x"]] = 9
+check(edge[M.fields.Edge.right][M.fields.Outer_3a_3aThing["9x"]] == 9, "second nested aggregate")
+
+local factory = ffi.new(M.types.user_types.Factory)
+local rows = ffi.new("int32_t *[3]")
+factory[M.fields.Factory.rows] = ffi.cast("int32_t *(*)[3]", rows)
+check(factory[M.fields.Factory.rows][0][2] == rows[2], "pointer to an array of pointers")
+factory[M.fields.Factory.make] = ffi.cast("int32_t *(*)(void)", function() return nil end)
+check(factory[M.fields.Factory.make] ~= nil, "function returning a pointer")
+
+local aliased = ffi.new(M.types.user_types.A)
+local zed = ffi.new(M.types.user_types.Zed)
+aliased[M.fields.A.p] = zed
+check(aliased[M.fields.A.p] == zed, "alias through a pointer")
+aliased[M.fields.A.v][M.fields.Zed.value] = 5
+check(aliased[M.fields.A.v][M.fields.Zed.value] == 5, "alias by value")
+check(M.types.user_types.UnusedBad ~= nil, "a forward-declared type is published")
+check(edge[M.fields.Edge.unused] == nil, "a pointer to an incomplete type")
+local nested = ffi.new(M.types.user_types.A2)
+nested[M.fields.A2.cb] = nil
+check(nested[M.fields.A2.cb] == nil, "pointer to a function taking a pointer to an array")
+check(ffi.sizeof(M.types.user_types.ZeroUnion) == 1, "zero-length member union")
+
+-- Source names are data: they reach the resolver byte for byte and never
+-- become Lua syntax.
+check(M.types.user_types[weird_type] ~= nil, "a hostile type name is a table key")
+check(M.fields[weird_type]["value"] == "value", "its members are addressable")
+-- Bracket bytes in a name are data: the cdef literal is chosen deep enough for
+-- the embedded `]]`/`]===]` above, and these names must survive it unchanged.
+for name, label in pairs({
+  [closing_bracket] = "]=]",
+  [trailing_bracket] = "]",
+}) do
+  check(M.types.user_types[name] ~= nil, "a name ending with " .. label .. " is a table key")
+  check(ffi.sizeof(M.types.user_types[name]) == 4, "and its layout is intact")
+end
+check(M.functions[weird_function] ~= nil, "a hostile function name is a table key")
+check(M.functions["end"].member == "end", "a Lua keyword is only a member name")
+
+local seen = {}
+local api = M.bind(function(name, offset)
+  seen[#seen + 1] = name
+  return nil
+end)
+check(#seen == 2, "both functions were described")
+local exact = 0
+for _, name in ipairs(seen) do
+  if name == weird_function then exact = exact + 1 end
+  if name == "end" then exact = exact + 1 end
+end
+check(exact == 2, "the resolver received the exact source names")
+check(ffi.istype(M.api_type, api), "bind returns the declared record")
+check(api["end"] == nil, "a nil answer leaves the member NULL")
+
+if failures == 0 then
+  io.write("edges-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+#[cfg(target_os = "linux")]
+const FFI_DUPLICATE_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+require("module")
+local ok, err = pcall(dofile, "module.lua")
+check(not ok, "a second copy of the module is refused")
+check(tostring(err):find("s2c: ctype already defined", 1, true) ~= nil,
+  "before registering: " .. tostring(err))
+if failures == 0 then
+  io.write("duplicate-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+#[cfg(target_os = "linux")]
+const FFI_PREDEFINED_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+-- Same name, different size and signedness: silently reusing it would validate
+-- a different type.
+ffi.cdef[[ typedef int32_t s2c_e_Wide; ]]
+local ok, err = pcall(require, "module")
+check(not ok, "an existing definition is refused")
+check(tostring(err):find("s2c: ctype already defined: s2c_e_Wide", 1, true) ~= nil,
+  "before registering: " .. tostring(err))
+if failures == 0 then
+  io.write("predefined-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+/// A host that declared the record's tag but not its typedef.
+#[cfg(target_os = "linux")]
+const FFI_PREDEFINED_TAG_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+ffi.cdef[[ struct s2c_api { int placeholder; }; ]]
+local ok, err = pcall(require, "module")
+check(not ok, "an existing tag is refused")
+check(tostring(err):find("s2c: ctype already defined: struct s2c_api", 1, true) ~= nil,
+  "before registering: " .. tostring(err))
+if failures == 0 then
+  io.write("predefined-tag-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+#[cfg(target_os = "linux")]
+const FFI_WIDE_OFFSET_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+local M = require("wide")
+local expected = ffi.cast("uintptr_t", 0x20000000000001ULL)
+check(M.functions["far"].offset == expected, "the table carries the exact offset")
+local seen
+local api = M.bind(function(name, offset) seen = offset return nil end)
+check(seen == expected, "the resolver received " .. tostring(seen))
+check(api[M.functions["far"].member] == nil, "a nil answer leaves the member NULL")
+if failures == 0 then
+  io.write("wide-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+#[cfg(target_os = "linux")]
+const FFI_NARROW_CONSUMER: &str = r#"
+local ffi = require("ffi")
+local failures = 0
+local function check(condition, message)
+  if not condition then
+    io.write("failed: ", message, "\n")
+    failures = failures + 1
+  end
+end
+local ok, err = pcall(require, "narrow")
+check(not ok, "a 32-bit module is refused by a 64-bit interpreter")
+-- The contract is the prefix plus both widths, not a particular wording.
+local message = tostring(err)
+check(message:find("s2c: ", 1, true) == 1, "the message is prefixed: " .. message)
+check(message:find("4-byte", 1, true) ~= nil, "it names the target width: " .. message)
+check(message:find("8-byte", 1, true) ~= nil, "and this interpreter's width: " .. message)
+if failures == 0 then
+  io.write("narrow-ok\n")
+end
+os.exit(failures == 0 and 0 or 1)
+"#;
+
+/// The publish gate: an unverified module is never written, and an existing
+/// file is never replaced.
+#[cfg(target_os = "linux")]
+#[test]
+fn ffi_cli_failure_publication() {
+    let Some(cc) = tool("cc") else { return };
+    let Some(luajit) = tool("luajit") else { return };
+    let directory = tempdir("ffi-publish");
+    let library = build_shared_probe(&directory, &cc);
+    let module = directory.join("out.lua");
+
+    // A missing interpreter is a check failure, not a silent publish.
+    let result = ffi_args(
+        "dwarf-c",
+        &library,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+        ],
+        &module,
+        Path::new("/nonexistent/sym2isf-luajit"),
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(
+        result.stderr.contains("LuaJitCheck"),
+        "{}",
+        result.describe()
+    );
+    assert!(!module.exists(), "nothing is published without a check");
+
+    // An interpreter that runs and fails is the same refusal.
+    let result = ffi_args(
+        "dwarf-c",
+        &library,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+        ],
+        &module,
+        Path::new("/bin/false"),
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(
+        result.stderr.contains("LuaJitCheck"),
+        "{}",
+        result.describe()
+    );
+    assert!(!module.exists());
+
+    // A type the shared model can describe but LuaJIT refuses is caught by the
+    // real parser, not by a guess about what it accepts.
+    let source = directory.join("large.c");
+    std::fs::write(
+        &source,
+        "struct FfiTooLarge { unsigned char bytes[0x20000000]; };\nstruct FfiTooLarge *anchor;\n",
+    )
+    .expect("source");
+    let object = directory.join("large.o");
+    compile(
+        Command::new(&cc)
+            .args([
+                "-O0",
+                "-g",
+                "-gdwarf-4",
+                "-fno-eliminate-unused-debug-types",
+                "-c",
+            ])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object),
+    );
+    let bad = directory.join("bad.lua");
+    let result = ffi_args(
+        "dwarf-c",
+        &object,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("FfiTooLarge"),
+        ],
+        &bad,
+        &luajit,
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(
+        result.stderr.contains("LuaJitCheck"),
+        "{}",
+        result.describe()
+    );
+    assert!(!bad.exists(), "a refused module is never published");
+
+    // An existing output wins over a missing input, and keeps its bytes.
+    let sentinel = directory.join("sentinel.lua");
+    std::fs::write(&sentinel, "-- keep me\n").expect("sentinel");
+    let result = ffi_args(
+        "dwarf-c",
+        &directory.join("no-such-image.so"),
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+        ],
+        &sentinel,
+        &luajit,
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(
+        result.stderr.contains("OutputExists"),
+        "{}",
+        result.describe()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("sentinel"),
+        "-- keep me\n"
+    );
+
+    // A relative interpreter path resolves against the invoking directory, not
+    // against the temporary one the module is checked in.
+    let link = directory.join("relative-luajit");
+    std::os::unix::fs::symlink(&luajit, &link).expect("symlink");
+    let published = directory.join("relative.lua");
+    let mut argv: Vec<std::ffi::OsString> = vec![
+        "dwarf-c".into(),
+        library.as_os_str().to_owned(),
+        "--emit".into(),
+        "ffi".into(),
+        "--type".into(),
+        "Packet".into(),
+        "--output".into(),
+        published.as_os_str().to_owned(),
+        "--luajit".into(),
+        "./relative-luajit".into(),
+    ];
+    let result = cli_in(Some(&directory), argv.drain(..));
+    assert!(result.success(), "{}", result.describe());
+    assert!(published.is_file(), "the checked module is published");
+
+    // A flag the module cannot honour is refused instead of ignored.
+    let refused = directory.join("refused.lua");
+    let result = ffi_args(
+        "dwarf-c",
+        &library,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("ffi"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--with-addresses"),
+        ],
+        &refused,
+        &luajit,
+    );
+    assert_eq!(result.status, Some(2), "{}", result.describe());
+    assert!(!refused.exists());
+
+    // And a request without a selection is a usage error.
+    let unselected = directory.join("unselected.lua");
+    let result = ffi_args(
+        "dwarf-c",
+        &library,
+        &[OsStr::new("--emit"), OsStr::new("ffi")],
+        &unselected,
+        &luajit,
+    );
+    assert_eq!(result.status, Some(2), "{}", result.describe());
+    assert!(!unselected.exists());
 }
