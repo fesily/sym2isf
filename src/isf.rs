@@ -555,11 +555,86 @@ enum State {
     Done,
 }
 
+/// Static size of a reference, `None` for `void`, incomplete aggregates and
+/// function types.
+///
+/// This is the single static-size rule shared by the validator and the C
+/// generator: pointer-width overrides are honoured, array and aggregate spans are
+/// checked, and the remaining alias count bounds alias recursion instead of
+/// allocating a visited set.
+pub(crate) fn type_size(document: &IsfDocument, reference: &TypeRef) -> Result<Option<u64>> {
+    size_of(document, reference, document.typedefs.len())
+}
+
+fn size_of(
+    document: &IsfDocument,
+    reference: &TypeRef,
+    aliases_left: usize,
+) -> Result<Option<u64>> {
+    let pointer_size = document.metadata.sym2isf.target.pointer_size;
+    match reference {
+        TypeRef::Base { name, .. } => {
+            let base = document.base_types.get(name).ok_or_else(|| {
+                Error::InvalidDocument(format!("dangling reference to missing base type `{name}`"))
+            })?;
+            if base.kind == BaseKind::Void {
+                Ok(None)
+            } else {
+                Ok(Some(base.size))
+            }
+        }
+        TypeRef::Struct { name, .. } | TypeRef::Union { name, .. } => {
+            let user = document.user_types.get(name).ok_or_else(|| {
+                Error::InvalidDocument(format!("dangling reference to missing user type `{name}`"))
+            })?;
+            if user.incomplete == Some(true) {
+                Ok(None)
+            } else {
+                Ok(Some(user.size))
+            }
+        }
+        TypeRef::Enum { name, .. } => {
+            let enum_type = document.enums.get(name).ok_or_else(|| {
+                Error::InvalidDocument(format!("dangling reference to missing enum `{name}`"))
+            })?;
+            Ok(Some(enum_type.size))
+        }
+        TypeRef::Typedef { name, .. } => {
+            if aliases_left == 0 {
+                return Err(Error::InvalidDocument(format!(
+                    "typedef alias cycle at `{name}`"
+                )));
+            }
+            let target = document.typedefs.get(name).ok_or_else(|| {
+                Error::InvalidDocument(format!("dangling reference to missing typedef `{name}`"))
+            })?;
+            size_of(document, target, aliases_left - 1)
+        }
+        TypeRef::Pointer { size, .. } => Ok(Some(size.unwrap_or(pointer_size))),
+        TypeRef::Array { count, subtype, .. } => {
+            if *count == 0 {
+                return Ok(Some(0));
+            }
+            match size_of(document, subtype, aliases_left)? {
+                Some(element) => count.checked_mul(element).map(Some).ok_or_else(|| {
+                    Error::InvalidDocument(format!(
+                        "array span overflows: {count} * {element} bytes"
+                    ))
+                }),
+                None => Err(Error::InvalidDocument(
+                    "array element type has no static size".to_string(),
+                )),
+            }
+        }
+        TypeRef::Bitfield { ty, .. } => size_of(document, ty, aliases_left),
+        TypeRef::Function { .. } => Ok(None),
+    }
+}
+
 struct Validator<'a> {
     doc: &'a IsfDocument,
     pointer_size: u64,
     states: BTreeMap<DefKey, State>,
-    size_stack: Vec<String>,
     value_states: BTreeMap<DefKey, State>,
 }
 
@@ -569,7 +644,6 @@ impl<'a> Validator<'a> {
             doc,
             pointer_size: doc.metadata.sym2isf.target.pointer_size,
             states: BTreeMap::new(),
-            size_stack: Vec::new(),
             value_states: BTreeMap::new(),
         }
     }
@@ -845,7 +919,7 @@ impl<'a> Validator<'a> {
             }
             TypeRef::Array { count, subtype, .. } => {
                 self.check_ref(subtype)?;
-                let element = self.size_of(subtype)?.ok_or_else(|| {
+                let element = type_size(self.doc, subtype)?.ok_or_else(|| {
                     Self::invalid("array element type has no static size".to_string())
                 })?;
                 count.checked_mul(element).ok_or_else(|| {
@@ -916,67 +990,6 @@ impl<'a> Validator<'a> {
         Ok(())
     }
 
-    /// Static size of a reference, `None` for `void`, incomplete aggregates and
-    /// function types.
-    fn size_of(&mut self, reference: &TypeRef) -> Result<Option<u64>> {
-        match reference {
-            TypeRef::Base { name, .. } => {
-                let base = self.doc.base_types.get(name).ok_or_else(|| {
-                    Self::invalid(format!("dangling reference to missing base type `{name}`"))
-                })?;
-                if base.kind == BaseKind::Void {
-                    Ok(None)
-                } else {
-                    Ok(Some(base.size))
-                }
-            }
-            TypeRef::Struct { name, .. } | TypeRef::Union { name, .. } => {
-                let user = self.doc.user_types.get(name).ok_or_else(|| {
-                    Self::invalid(format!("dangling reference to missing user type `{name}`"))
-                })?;
-                if user.incomplete == Some(true) {
-                    Ok(None)
-                } else {
-                    Ok(Some(user.size))
-                }
-            }
-            TypeRef::Enum { name, .. } => {
-                let enum_type = self.doc.enums.get(name).ok_or_else(|| {
-                    Self::invalid(format!("dangling reference to missing enum `{name}`"))
-                })?;
-                Ok(Some(enum_type.size))
-            }
-            TypeRef::Typedef { name, .. } => {
-                if self.size_stack.iter().any(|n| n == name) {
-                    return Err(Self::invalid(format!("typedef alias cycle at `{name}`")));
-                }
-                let target = self.doc.typedefs.get(name).ok_or_else(|| {
-                    Self::invalid(format!("dangling reference to missing typedef `{name}`"))
-                })?;
-                self.size_stack.push(name.clone());
-                let result = self.size_of(target);
-                self.size_stack.pop();
-                result
-            }
-            TypeRef::Pointer { size, .. } => Ok(Some(size.unwrap_or(self.pointer_size))),
-            TypeRef::Array { count, subtype, .. } => {
-                if *count == 0 {
-                    return Ok(Some(0));
-                }
-                match self.size_of(subtype)? {
-                    Some(element) => count.checked_mul(element).map(Some).ok_or_else(|| {
-                        Self::invalid(format!("array span overflows: {count} * {element} bytes"))
-                    }),
-                    None => Err(Self::invalid(
-                        "array element type has no static size".to_string(),
-                    )),
-                }
-            }
-            TypeRef::Bitfield { ty, .. } => self.size_of(ty),
-            TypeRef::Function { .. } => Ok(None),
-        }
-    }
-
     fn is_void(&self, reference: &TypeRef) -> bool {
         match reference {
             TypeRef::Base { name, .. } => self
@@ -996,7 +1009,7 @@ impl<'a> Validator<'a> {
         let user = self.doc.user_types[&name].clone();
         let complete = user.incomplete != Some(true);
         for (field_name, field) in &user.fields {
-            let size = self.size_of(&field.ty)?;
+            let size = type_size(self.doc, &field.ty)?;
             match size {
                 Some(size) => {
                     let end = field.offset.checked_add(size).ok_or_else(|| {

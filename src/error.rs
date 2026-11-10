@@ -158,6 +158,24 @@ pub enum Error {
         machine: String,
     },
 
+    /// A record cannot be rendered as C source without inventing layout.
+    #[error("cannot generate C for {location}: {detail}")]
+    CGeneration {
+        /// Root type, type or field the failure belongs to.
+        location: String,
+        /// Why the record cannot be expressed.
+        detail: String,
+    },
+
+    /// The external TCC compiler rejected the generated translation unit.
+    #[error("TCC compilation failed using {}: {detail}", executable.display())]
+    TccCompile {
+        /// Compiler executable that was invoked.
+        executable: PathBuf,
+        /// Exit status and captured output.
+        detail: String,
+    },
+
     /// Checked arithmetic failed while normalizing sizes or offsets.
     #[error("{location}: arithmetic overflow while computing {what}")]
     Overflow {
@@ -213,6 +231,8 @@ impl Error {
             Error::AmbiguousDefinition { .. } => "AmbiguousDefinition",
             Error::UnsupportedPdbRecord { .. } => "UnsupportedPdbRecord",
             Error::UnsupportedTarget { .. } => "UnsupportedTarget",
+            Error::CGeneration { .. } => "CGeneration",
+            Error::TccCompile { .. } => "TccCompile",
             Error::Overflow { .. } => "Overflow",
             Error::InvalidDocument(_) => "InvalidDocument",
             Error::Json(_) => "Json",

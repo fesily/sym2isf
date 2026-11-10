@@ -131,10 +131,21 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(env!("CARGO_BIN_EXE_sym2isf"))
-        .args(args)
-        .output()
-        .expect("run sym2isf");
+    cli_in(None, args)
+}
+
+/// Run the CLI in `directory`, when given, as its working directory.
+fn cli_in<I, S>(directory: Option<&Path>, args: I) -> CliOutput
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sym2isf"));
+    command.args(args);
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    let output = command.output().expect("run sym2isf");
     CliOutput {
         status: output.status.code(),
         stdout: output.stdout,
@@ -1227,7 +1238,16 @@ fn cli_output_contract_on_a_real_input() {
 
 /// Directory with `probe.pdb`, `probe.exe` and `oracle.json` produced elsewhere.
 fn pdb_artifacts() -> Option<PathBuf> {
-    let directory = std::env::var_os("SYM2ISF_PDB_DIR").map(PathBuf::from)?;
+    let directory = match std::env::var_os("SYM2ISF_PDB_DIR") {
+        Some(directory) => PathBuf::from(directory),
+        None if native_required() => {
+            panic!("SYM2ISF_NATIVE_TESTS=1 but SYM2ISF_PDB_DIR is not set")
+        }
+        None => {
+            eprintln!("skipping: SYM2ISF_PDB_DIR is not set");
+            return None;
+        }
+    };
     for name in ["probe.pdb", "probe.exe", "oracle.json"] {
         let path = directory.join(name);
         if !path.is_file() {
@@ -2029,5 +2049,951 @@ fn cl_names_a_type_by_its_translation_unit() {
     assert!(
         suffixed[0].0.ends_with("@tu_one.obj") || suffixed[0].0.ends_with("@tu_two.obj"),
         "the suffix is the unit that defined it: {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PDB types as C declarations, accepted and executed by a real TCC
+// ---------------------------------------------------------------------------
+
+fn c_source(
+    subcommand: &str,
+    input: &Path,
+    roots: &[&str],
+    output: &Path,
+    tcc: &Path,
+) -> CliOutput {
+    let mut args: Vec<std::ffi::OsString> = vec![subcommand.into(), input.as_os_str().to_owned()];
+    for root in roots {
+        args.push("--type".into());
+        args.push((*root).into());
+    }
+    args.push("--output".into());
+    args.push(output.as_os_str().to_owned());
+    args.push("--tcc".into());
+    args.push(tcc.as_os_str().to_owned());
+    cli(args)
+}
+
+/// Compile and run a consumer translation unit with TCC, returning stdout.
+#[cfg(target_os = "linux")]
+fn tcc_run(tcc: &Path, directory: &Path, source: &str) -> String {
+    let path = directory.join("consumer.c");
+    std::fs::write(&path, source).expect("consumer source");
+    let output = Command::new(tcc)
+        .args(["-Werror", "-run"])
+        .arg(&path)
+        .current_dir(directory)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", tcc.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "consumer failed with {}\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// Consumer that checks the generated declarations against a real layout oracle.
+///
+/// Both frontends feed this same program: the fixture, the oracle and therefore
+/// the expected bytes are identical, so a DWARF and a PDB document must describe
+/// the same memory.
+#[cfg(target_os = "linux")]
+fn layout_consumer(oracle: &Oracle) -> String {
+    let matrix_last = oracle.offsets["Packet"]["matrix"] + (3 + 2) * 2;
+    let nodes_value =
+        oracle.offsets["Packet"]["nodes"] + oracle.sizes["Node"] + oracle.offsets["Node"]["value"];
+    let bits_bytes: String = oracle
+        .bits_bytes
+        .iter()
+        .map(|byte| format!("0x{byte:02x}, "))
+        .collect();
+    format!(
+        r#"
+#include <stdio.h>
+#include <string.h>
+
+static int failures = 0;
+#define CHECK(condition) do {{ if (!(condition)) {{ printf("failed: %s\n", #condition); failures = 1; }} }} while (0)
+
+int main(void)
+{{
+    s2c_s_Packed packed;
+    memset(&packed, 0, sizeof packed);
+    packed.tag = 0x5a;
+    packed.value = 0xdeadbeefu;
+    CHECK(sizeof packed == {packed_size});
+    CHECK(offsetof(s2c_s_Packed, tag) == {packed_tag});
+    CHECK(offsetof(s2c_s_Packed, value) == {packed_value});
+    {{
+        const unsigned char expected[5] = {{0x5a, 0xef, 0xbe, 0xad, 0xde}};
+        CHECK(memcmp(&packed, expected, 5) == 0);
+    }}
+
+    s2c_s_Node node;
+    memset(&node, 0, sizeof node);
+    node.value = 0x11223344;
+    node.next = &node;
+    CHECK(node.next == &node);
+    CHECK(node.value == 0x11223344);
+    CHECK(sizeof(s2c_s_Node) == {node_size});
+    CHECK(offsetof(s2c_s_Node, next) == {node_next});
+
+    s2c_s_Packet packet;
+    memset(&packet, 0, sizeof packet);
+    packet.next = &packet;
+    CHECK(packet.next == &packet);
+    packet.nodes[1].next = &node;
+    packet.nodes[1].value = 1234567;
+    CHECK(packet.nodes[0].next == 0);
+    CHECK(packet.nodes[1].next == &node);
+    CHECK(packet.nodes[1].value == 1234567);
+    CHECK(offsetof(s2c_s_Packet, nodes) == {packet_nodes});
+    CHECK(offsetof(s2c_s_Packet, nodes[1].value) == {nodes_value});
+    packet.payload.word = 0xfeedfaceu;
+    CHECK(packet.payload.word == 0xfeedfaceu);
+    packet.payload.bytes[0] = 0x11;
+    CHECK(packet.payload.word == 0xfeedfa11u);
+    packet.matrix[1][2] = 0x55aau;
+    CHECK(packet.matrix[1][2] == 0x55aau);
+    CHECK(offsetof(s2c_s_Packet, matrix[1][2]) == {matrix_last});
+    CHECK(offsetof(s2c_s_Packet, code) == {packet_code});
+    CHECK(offsetof(s2c_s_Packet, callback) == {packet_callback});
+    CHECK(packet.code == 0);
+    packet.code = s2c_e_SignedCode_CODE__NEG;
+    CHECK(packet.code == -3);
+    packet.callback = 0;
+    CHECK(packet.callback == 0);
+    CHECK(sizeof(s2c_s_Packet) == {packet_size});
+    CHECK(sizeof(s2c_u_Value) == {value_size});
+
+    s2c_s_Bits bits;
+    memset(&bits, 0, sizeof bits);
+    s2c_s_Bits_set_pad(&bits, {bits_pad});
+    s2c_s_Bits_set_field(&bits, {bits_field});
+    s2c_s_Bits_set_tail(&bits, {bits_tail});
+    CHECK(s2c_s_Bits_get_pad(&bits) == {bits_pad});
+    CHECK(s2c_s_Bits_get_field(&bits) == {bits_field});
+    CHECK(s2c_s_Bits_get_tail(&bits) == {bits_tail});
+    CHECK(sizeof(s2c_s_Bits) == {bits_size});
+    {{
+        const unsigned char expected[{bits_length}] = {{{bits_bytes}}};
+        CHECK(memcmp(&bits, expected, sizeof bits) == 0);
+    }}
+    {{
+        unsigned char before[4];
+        memcpy(before, &bits, sizeof bits);
+        s2c_s_Bits_set_field(&bits, 7);
+        CHECK(s2c_s_Bits_get_field(&bits) == 7);
+        CHECK(s2c_s_Bits_get_pad(&bits) == {bits_pad});
+        CHECK(s2c_s_Bits_get_tail(&bits) == {bits_tail});
+        CHECK((((const unsigned char *)&bits)[0] & 0x07) == ({bits_pad} & 0x07));
+        CHECK(((const unsigned char *)&bits)[1] == before[1]);
+        CHECK(((const unsigned char *)&bits)[2] == 0);
+        CHECK(((const unsigned char *)&bits)[3] == 0);
+    }}
+
+    printf("%s\n", failures ? "layout-failed" : "layout-ok");
+    return failures;
+}}
+"#,
+        packed_size = oracle.sizes["Packed"],
+        packed_tag = oracle.offsets["Packed"]["tag"],
+        packed_value = oracle.offsets["Packed"]["value"],
+        node_size = oracle.sizes["Node"],
+        node_next = oracle.offsets["Node"]["next"],
+        packet_size = oracle.sizes["Packet"],
+        packet_nodes = oracle.offsets["Packet"]["nodes"],
+        packet_code = oracle.offsets["Packet"]["code"],
+        packet_callback = oracle.offsets["Packet"]["callback"],
+        nodes_value = nodes_value,
+        matrix_last = matrix_last,
+        value_size = oracle.sizes["Value"],
+        bits_size = oracle.sizes["Bits"],
+        bits_pad = oracle.bits_values["pad"],
+        bits_field = oracle.bits_values["field"],
+        bits_tail = oracle.bits_values["tail"],
+        bits_bytes = bits_bytes,
+        bits_length = oracle.bits_bytes.len(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pdb_c_tcc_round_trip() {
+    let Some(directory) = pdb_artifacts() else {
+        return;
+    };
+    let Some(tcc) = tool("tcc") else { return };
+    let oracle = {
+        let text = std::fs::read_to_string(directory.join("oracle.json")).expect("oracle");
+        Oracle::parse(&text)
+    };
+    let pdb = directory.join("probe.pdb");
+    // Generated sources, sentinels and the consumer stay in a private directory:
+    // the artifact directory only hosts the probe and its oracle.
+    let scratch = tempdir("pdb-c");
+
+    let source_path = scratch.join("layout.c");
+    let result = c_source(
+        "pdb-c",
+        &pdb,
+        &["Packet", "Packed", "Bits"],
+        &source_path,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(
+        result.stdout.is_empty(),
+        "stdout stays empty: {}",
+        result.describe()
+    );
+    assert!(
+        result.stderr.contains("TCC-checked C source"),
+        "{}",
+        result.stderr
+    );
+    let source = std::fs::read_to_string(&source_path).expect("generated source");
+    assert!(
+        source.ends_with('\n'),
+        "the translation unit ends with a newline"
+    );
+
+    // Root order and duplicates are not part of the output.
+    let reordered = scratch.join("layout-reordered.c");
+    let again = c_source(
+        "pdb-c",
+        &pdb,
+        &["Bits", "Packet", "Packed", "Bits"],
+        &reordered,
+        &tcc,
+    );
+    assert!(again.success(), "{}", again.describe());
+    assert_eq!(
+        std::fs::read(&reordered).unwrap(),
+        std::fs::read(&source_path).unwrap(),
+        "root order does not change the generated bytes"
+    );
+
+    // A missing compiler is a typed failure and publishes nothing.
+    let missing = scratch.join("layout-missing-tcc.c");
+    let result = c_source(
+        "pdb-c",
+        &pdb,
+        &["Packet"],
+        &missing,
+        Path::new("/nonexistent/sym2isf-tcc"),
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(result.stderr.contains("TccCompile"), "{}", result.stderr);
+    assert!(!missing.exists(), "no source is published without TCC");
+
+    // A compiler that rejects the unit is a failure, not a publish.
+    let rejected = scratch.join("layout-rejected.c");
+    let result = c_source(
+        "pdb-c",
+        &pdb,
+        &["Packet"],
+        &rejected,
+        Path::new("/bin/false"),
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(result.stderr.contains("TccCompile"), "{}", result.stderr);
+    assert!(!rejected.exists(), "a rejected unit publishes nothing");
+
+    // An existing output is never replaced, even by a successful generation, and
+    // it is checked before the input is even opened.
+    let sentinel = scratch.join("layout-sentinel.c");
+    std::fs::write(&sentinel, b"keep me\n").unwrap();
+    let result = c_source("pdb-c", &pdb, &["Packet"], &sentinel, &tcc);
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(result.stderr.contains("OutputExists"), "{}", result.stderr);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me\n");
+    let result = c_source(
+        "pdb-c",
+        Path::new("/nonexistent/probe.pdb"),
+        &["Packet"],
+        &sentinel,
+        &tcc,
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(result.stderr.contains("OutputExists"), "{}", result.stderr);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me\n");
+
+    // The root set is mandatory: clap reports a usage error, not a conversion.
+    let without_type = cli([
+        OsStr::new("pdb-c"),
+        pdb.as_os_str(),
+        OsStr::new("--output"),
+        sentinel.as_os_str(),
+    ]);
+    assert_eq!(without_type.status, Some(2), "{}", without_type.describe());
+
+    let consumer = layout_consumer(&oracle);
+    let stdout = tcc_run(&tcc, &scratch, &format!("{source}{consumer}"));
+    assert_eq!(stdout, "layout-ok\n", "the consumer reported a mismatch");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dwarf_c_tcc_round_trip() {
+    let Some(cc) = tool("cc") else { return };
+    let Some(tcc) = tool("tcc") else { return };
+    let directory = tempdir("dwarf-c");
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let oracle = Oracle::parse(&run_binary(&binary));
+
+    let source_path = directory.join("layout.c");
+    let result = c_source(
+        "dwarf-c",
+        &binary,
+        &["Packet", "Packed", "Bits"],
+        &source_path,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(
+        result.stdout.is_empty(),
+        "stdout stays empty: {}",
+        result.describe()
+    );
+    assert!(
+        result.stderr.contains("TCC-checked C source"),
+        "{}",
+        result.stderr
+    );
+    let source = std::fs::read_to_string(&source_path).expect("generated source");
+
+    // Root order and duplicates are not part of the output.
+    let reordered = directory.join("layout-reordered.c");
+    let again = c_source(
+        "dwarf-c",
+        &binary,
+        &["Bits", "Packed", "Packet", "Packed"],
+        &reordered,
+        &tcc,
+    );
+    assert!(again.success(), "{}", again.describe());
+    assert_eq!(
+        std::fs::read(&reordered).unwrap(),
+        std::fs::read(&source_path).unwrap(),
+        "root order does not change the generated bytes"
+    );
+
+    // A relative `--tcc` resolves against the invoking directory, not the
+    // private build directory the compiler runs in.
+    let shim = directory.join("shim");
+    std::fs::create_dir_all(&shim).unwrap();
+    std::os::unix::fs::symlink(
+        std::fs::canonicalize(&tcc).expect("tcc path"),
+        shim.join("tcc"),
+    )
+    .expect("symlink to tcc");
+    let relative = directory.join("layout-relative.c");
+    let result = cli_in(
+        Some(&directory),
+        [
+            OsStr::new("dwarf-c"),
+            binary.as_os_str(),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            OsStr::new("--output"),
+            relative.as_os_str(),
+            OsStr::new("--tcc"),
+            OsStr::new("./shim/tcc"),
+        ],
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(
+        relative.is_file(),
+        "a relative compiler path is resolved against the caller"
+    );
+
+    // The same consumer that checks the PDB document checks the DWARF one.
+    let consumer = layout_consumer(&oracle);
+    let stdout = tcc_run(&tcc, &directory, &format!("{source}{consumer}"));
+    assert_eq!(stdout, "layout-ok\n", "the consumer reported a mismatch");
+}
+
+/// A document that only the generator can produce: hostile names, declarator
+/// precedence, zero-length arrays, a forward-only pointer target and bit-fields
+/// that start mid-byte and span nine bytes.
+#[cfg(target_os = "linux")]
+fn edge_document() -> IsfDocument {
+    use sym2isf::isf::IntValue;
+    use sym2isf::{BaseKind, BaseType, CompositeKind, Field, Target, TypeRef, UserType};
+
+    fn base(kind: BaseKind, size: u64, signed: bool) -> BaseType {
+        BaseType {
+            kind,
+            size,
+            signed,
+            endian: Endian::Little,
+            alignment: None,
+            unsupported_reason: None,
+        }
+    }
+    fn reference(name: &str) -> TypeRef {
+        TypeRef::Base {
+            name: name.to_string(),
+            qualifiers: Vec::new(),
+        }
+    }
+    fn field(offset: u64, ty: TypeRef) -> Field {
+        Field {
+            offset,
+            ty,
+            anonymous: None,
+        }
+    }
+    fn user(kind: CompositeKind, size: u64, fields: Vec<(&str, Field)>) -> UserType {
+        UserType {
+            kind,
+            size,
+            fields: fields
+                .into_iter()
+                .map(|(name, member)| (name.to_string(), member))
+                .collect(),
+            alignment: None,
+            incomplete: None,
+            unsupported_reason: None,
+        }
+    }
+    fn pointer_to(ty: TypeRef) -> TypeRef {
+        TypeRef::Pointer {
+            subtype: Box::new(ty),
+            size: None,
+            qualifiers: Vec::new(),
+            reference_kind: None,
+        }
+    }
+    fn array_of(count: u64, ty: TypeRef) -> TypeRef {
+        TypeRef::Array {
+            count,
+            subtype: Box::new(ty),
+            qualifiers: Vec::new(),
+        }
+    }
+    fn slice(
+        offset: u64,
+        bit_position: u64,
+        bit_length: u64,
+        storage: &str,
+        declared: &str,
+    ) -> Field {
+        Field {
+            offset,
+            ty: TypeRef::Bitfield {
+                bit_length,
+                bit_position,
+                ty: Box::new(reference(storage)),
+                declared_type: Some(Box::new(reference(declared))),
+            },
+            anonymous: None,
+        }
+    }
+
+    let mut document = IsfDocument::empty(
+        Target {
+            architecture: "x86_64".to_string(),
+            pointer_size: 8,
+            endian: Endian::Little,
+        },
+        None,
+    );
+    document
+        .base_types
+        .insert("void".to_string(), base(BaseKind::Void, 0, false));
+    document
+        .base_types
+        .insert("uint8_t".to_string(), base(BaseKind::Int, 1, false));
+    document
+        .base_types
+        .insert("int32_t".to_string(), base(BaseKind::Int, 4, true));
+    document
+        .base_types
+        .insert("int64_t".to_string(), base(BaseKind::Int, 8, true));
+    document
+        .base_types
+        .insert("uint64_t".to_string(), base(BaseKind::Int, 8, false));
+    document
+        .base_types
+        .insert("wide_float".to_string(), base(BaseKind::Float, 16, true));
+    document
+        .base_types
+        .insert("__isf_bitsi72".to_string(), base(BaseKind::Int, 9, true));
+    document
+        .base_types
+        .insert("__isf_bitsu72".to_string(), base(BaseKind::Int, 9, false));
+    document
+        .base_types
+        .insert("__isf_bitsu8".to_string(), base(BaseKind::Int, 1, false));
+
+    document.user_types.insert(
+        "Outer::Thing".to_string(),
+        user(
+            CompositeKind::Struct,
+            4,
+            vec![("int", field(0, reference("int32_t")))],
+        ),
+    );
+    document.user_types.insert(
+        "Outer_3a_3aThing".to_string(),
+        user(
+            CompositeKind::Struct,
+            4,
+            vec![("9x", field(0, reference("int32_t")))],
+        ),
+    );
+    // Only reachable through a pointer: it must stay a declaration, so its
+    // 16-byte float member never has to become a C type.
+    document.user_types.insert(
+        "UnusedBad".to_string(),
+        user(
+            CompositeKind::Struct,
+            16,
+            vec![("wide", field(0, reference("wide_float")))],
+        ),
+    );
+    document.user_types.insert(
+        "ZeroUnion".to_string(),
+        user(
+            CompositeKind::Union,
+            1,
+            vec![
+                ("tag", field(0, reference("uint8_t"))),
+                ("bytes", field(0, array_of(0, reference("uint8_t")))),
+            ],
+        ),
+    );
+    document.user_types.insert(
+        "Edge".to_string(),
+        user(
+            CompositeKind::Struct,
+            56,
+            vec![
+                (
+                    "array_pointer",
+                    field(0, pointer_to(array_of(3, reference("int32_t")))),
+                ),
+                (
+                    "callbacks",
+                    field(
+                        8,
+                        array_of(
+                            2,
+                            pointer_to(TypeRef::Function {
+                                return_type: Box::new(reference("int32_t")),
+                                parameters: vec![sym2isf::Parameter {
+                                    name: None,
+                                    ty: reference("int32_t"),
+                                }],
+                                variadic: None,
+                                calling_convention: None,
+                                qualifiers: Vec::new(),
+                            }),
+                        ),
+                    ),
+                ),
+                (
+                    "left",
+                    field(
+                        24,
+                        TypeRef::Struct {
+                            name: "Outer::Thing".to_string(),
+                            qualifiers: Vec::new(),
+                        },
+                    ),
+                ),
+                (
+                    "right",
+                    field(
+                        28,
+                        TypeRef::Struct {
+                            name: "Outer_3a_3aThing".to_string(),
+                            qualifiers: Vec::new(),
+                        },
+                    ),
+                ),
+                (
+                    "code",
+                    field(
+                        32,
+                        TypeRef::Enum {
+                            name: "Wide".to_string(),
+                            qualifiers: Vec::new(),
+                        },
+                    ),
+                ),
+                (
+                    "unused",
+                    field(
+                        40,
+                        pointer_to(TypeRef::Struct {
+                            name: "UnusedBad".to_string(),
+                            qualifiers: Vec::new(),
+                        }),
+                    ),
+                ),
+                ("tail", field(48, array_of(0, reference("uint8_t")))),
+                (
+                    "zero",
+                    field(
+                        48,
+                        TypeRef::Union {
+                            name: "ZeroUnion".to_string(),
+                            qualifiers: Vec::new(),
+                        },
+                    ),
+                ),
+            ],
+        ),
+    );
+    document.user_types.insert(
+        "SignedBits64".to_string(),
+        user(
+            CompositeKind::Struct,
+            9,
+            vec![("value", slice(0, 3, 64, "__isf_bitsi72", "int64_t"))],
+        ),
+    );
+    document.user_types.insert(
+        "UnsignedBits64".to_string(),
+        user(
+            CompositeKind::Struct,
+            9,
+            vec![("value", slice(0, 3, 64, "__isf_bitsu72", "uint64_t"))],
+        ),
+    );
+    document
+        .typedefs
+        .insert("keep_t".to_string(), reference("uint8_t"));
+    // A pointer to a function returning a pointer, and a pointer to an array of
+    // pointers: both put a `*` on the far side of a suffix.
+    document.user_types.insert(
+        "Factory".to_string(),
+        user(
+            CompositeKind::Struct,
+            16,
+            vec![
+                (
+                    "make",
+                    field(
+                        0,
+                        pointer_to(TypeRef::Function {
+                            return_type: Box::new(pointer_to(reference("int32_t"))),
+                            parameters: Vec::new(),
+                            variadic: None,
+                            calling_convention: None,
+                            qualifiers: Vec::new(),
+                        }),
+                    ),
+                ),
+                (
+                    "rows",
+                    field(8, pointer_to(array_of(3, pointer_to(reference("int32_t"))))),
+                ),
+            ],
+        ),
+    );
+    // `A` sorts before `Zed`: the alias is reached first through a pointer and
+    // then by value, so only a stronger second visit orders the definition.
+    document.user_types.insert(
+        "Zed".to_string(),
+        user(
+            CompositeKind::Struct,
+            8,
+            vec![("value", field(0, reference("int64_t")))],
+        ),
+    );
+    document.typedefs.insert(
+        "Alias".to_string(),
+        TypeRef::Struct {
+            name: "Zed".to_string(),
+            qualifiers: Vec::new(),
+        },
+    );
+    document.user_types.insert(
+        "A".to_string(),
+        user(
+            CompositeKind::Struct,
+            16,
+            vec![
+                (
+                    "p",
+                    field(
+                        0,
+                        pointer_to(TypeRef::Typedef {
+                            name: "Alias".to_string(),
+                            qualifiers: Vec::new(),
+                        }),
+                    ),
+                ),
+                (
+                    "v",
+                    field(
+                        8,
+                        TypeRef::Typedef {
+                            name: "Alias".to_string(),
+                            qualifiers: Vec::new(),
+                        },
+                    ),
+                ),
+            ],
+        ),
+    );
+    // `A2` sorts before `Zed2`, and only the prototype's array element needs the
+    // definition.
+    document.user_types.insert(
+        "Zed2".to_string(),
+        user(
+            CompositeKind::Struct,
+            4,
+            vec![("value", field(0, reference("int32_t")))],
+        ),
+    );
+    document.user_types.insert(
+        "A2".to_string(),
+        user(
+            CompositeKind::Struct,
+            8,
+            vec![(
+                "cb",
+                field(
+                    0,
+                    pointer_to(TypeRef::Function {
+                        return_type: Box::new(reference("void")),
+                        parameters: vec![sym2isf::Parameter {
+                            name: None,
+                            ty: pointer_to(array_of(
+                                2,
+                                TypeRef::Struct {
+                                    name: "Zed2".to_string(),
+                                    qualifiers: Vec::new(),
+                                },
+                            )),
+                        }],
+                        variadic: None,
+                        calling_convention: None,
+                        qualifiers: Vec::new(),
+                    }),
+                ),
+            )],
+        ),
+    );
+    // A const volatile bit-field has no setter and is read through volatile bytes.
+    document.user_types.insert(
+        "ConstVolatile".to_string(),
+        user(
+            CompositeKind::Struct,
+            2,
+            vec![
+                (
+                    "keep",
+                    Field {
+                        offset: 0,
+                        ty: TypeRef::Bitfield {
+                            bit_length: 4,
+                            bit_position: 0,
+                            ty: Box::new(reference("__isf_bitsu8")),
+                            declared_type: Some(Box::new(TypeRef::Typedef {
+                                name: "keep_t".to_string(),
+                                qualifiers: vec![
+                                    sym2isf::Qualifier::Const,
+                                    sym2isf::Qualifier::Volatile,
+                                ],
+                            })),
+                        },
+                        anonymous: None,
+                    },
+                ),
+                ("plain", field(1, reference("uint8_t"))),
+            ],
+        ),
+    );
+    document.enums.insert(
+        "Wide".to_string(),
+        sym2isf::isf::EnumType {
+            size: 8,
+            base: Some("uint64_t".to_string()),
+            constants: BTreeMap::from([
+                (String::new(), IntValue::Unsigned(0)),
+                ("empty".to_string(), IntValue::Unsigned(1)),
+                ("max".to_string(), IntValue::Unsigned(u64::MAX)),
+            ]),
+        },
+    );
+    document
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn c_generation_tcc_edges() {
+    let Some(tcc) = tool("tcc") else { return };
+    let directory = tempdir("c-edges");
+    let document = edge_document();
+    let source = sym2isf::c::generate(
+        &document,
+        &[
+            "Edge",
+            "SignedBits64",
+            "UnsignedBits64",
+            "ConstVolatile",
+            "Factory",
+            "A",
+            "A2",
+        ],
+    )
+    .expect("the edge document is describable");
+    assert!(
+        !source.contains("s2c_s_UnusedBad {"),
+        "a pointer-only target stays a declaration"
+    );
+    assert!(
+        !source.contains("s2c_s_ConstVolatile_set_keep"),
+        "a const bit-field has no setter"
+    );
+
+    let consumer = r#"
+#include <stdio.h>
+#include <string.h>
+
+static int failures = 0;
+#define CHECK(condition) do { if (!(condition)) { printf("failed: %s\n", #condition); failures = 1; } } while (0)
+
+static int32_t plus_one(int32_t value) { return value + 1; }
+static int32_t *make_value(void) { return 0; }
+static void take_rows(s2c_s_Zed2 (*rows)[2]) { (void)rows; }
+
+int main(void)
+{
+    int32_t values[3] = {10, 20, 30};
+    s2c_s_Edge edge;
+    memset(&edge, 0, sizeof edge);
+    edge.array_pointer = &values;
+    CHECK((*edge.array_pointer)[2] == 30);
+    edge.callbacks[0] = plus_one;
+    CHECK(edge.callbacks[0](6) == 7);
+    edge.left.s2c_f_int = 7;
+    edge.right.s2c_f_9x = 9;
+    CHECK(edge.left.s2c_f_int == 7);
+    CHECK(edge.right.s2c_f_9x == 9);
+    edge.unused = 0;
+    CHECK(edge.unused == 0);
+    CHECK(sizeof(s2c_s_Edge) == 56);
+    CHECK(offsetof(s2c_s_Edge, array_pointer) == 0);
+    CHECK(offsetof(s2c_s_Edge, callbacks) == 8);
+    CHECK(offsetof(s2c_s_Edge, left) == 24);
+    CHECK(offsetof(s2c_s_Edge, right) == 28);
+    CHECK(offsetof(s2c_s_Edge, code) == 32);
+    CHECK(offsetof(s2c_s_Edge, unused) == 40);
+    CHECK(offsetof(s2c_s_Edge, tail) == 48);
+    CHECK(offsetof(s2c_s_Edge, zero) == 48);
+    CHECK(sizeof(s2c_u_ZeroUnion) == 1);
+    CHECK(s2c_e_Wide_empty == 0);
+    CHECK(s2c_e_Wide_empty_2 == 1);
+    CHECK(s2c_e_Wide_max == UINT64_MAX);
+
+    {
+        s2c_s_SignedBits64 signed_bits;
+        unsigned char *raw = (unsigned char *)&signed_bits;
+        memset(&signed_bits, 0, sizeof signed_bits);
+        raw[0] = 0x05;
+        raw[8] = 0xa8;
+        s2c_s_SignedBits64_set_value(&signed_bits, INT64_MIN);
+        CHECK(s2c_s_SignedBits64_get_value(&signed_bits) == INT64_MIN);
+        {
+            const unsigned char expected[9] = {0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac};
+            CHECK(memcmp(raw, expected, sizeof expected) == 0);
+        }
+        s2c_s_SignedBits64_set_value(&signed_bits, -1);
+        CHECK(s2c_s_SignedBits64_get_value(&signed_bits) == -1);
+        {
+            const unsigned char expected[9] = {0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xaf};
+            CHECK(memcmp(raw, expected, sizeof expected) == 0);
+        }
+        s2c_s_SignedBits64_set_value(&signed_bits, 0);
+        CHECK(s2c_s_SignedBits64_get_value(&signed_bits) == 0);
+        {
+            const unsigned char expected[9] = {0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa8};
+            CHECK(memcmp(raw, expected, sizeof expected) == 0);
+        }
+        CHECK(sizeof(s2c_s_SignedBits64) == 9);
+    }
+
+    {
+        s2c_s_UnsignedBits64 unsigned_bits;
+        unsigned char *raw = (unsigned char *)&unsigned_bits;
+        memset(&unsigned_bits, 0, sizeof unsigned_bits);
+        raw[0] = 0x05;
+        raw[8] = 0xa8;
+        s2c_s_UnsignedBits64_set_value(&unsigned_bits, UINT64_MAX);
+        CHECK(s2c_s_UnsignedBits64_get_value(&unsigned_bits) == UINT64_MAX);
+        {
+            const unsigned char expected[9] = {0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xaf};
+            CHECK(memcmp(raw, expected, sizeof expected) == 0);
+        }
+        s2c_s_UnsignedBits64_set_value(&unsigned_bits, 0);
+        CHECK(s2c_s_UnsignedBits64_get_value(&unsigned_bits) == 0);
+        {
+            const unsigned char expected[9] = {0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa8};
+            CHECK(memcmp(raw, expected, sizeof expected) == 0);
+        }
+        CHECK(sizeof(s2c_s_UnsignedBits64) == 9);
+    }
+
+    {
+        s2c_s_Factory factory;
+        int32_t *row_values[3];
+        memset(&factory, 0, sizeof factory);
+        factory.make = make_value;
+        CHECK(factory.make == make_value);
+        factory.rows = &row_values;
+        CHECK((*factory.rows)[0] == row_values[0]);
+        CHECK((*factory.rows)[2] == row_values[2]);
+        CHECK(sizeof(s2c_s_Factory) == 16);
+    }
+
+    {
+        s2c_s_A a;
+        memset(&a, 0, sizeof a);
+        a.p = &a.v;
+        CHECK(a.p == &a.v);
+        a.v.value = 5;
+        CHECK(a.p->value == 5);
+        CHECK(sizeof(s2c_s_A) == 16);
+        CHECK(sizeof(s2c_s_Zed) == 8);
+    }
+
+    {
+        s2c_s_A2 a2;
+        memset(&a2, 0, sizeof a2);
+        a2.cb = take_rows;
+        CHECK(a2.cb == take_rows);
+        CHECK(sizeof(s2c_s_A2) == 8);
+    }
+
+    {
+        s2c_s_ConstVolatile cv;
+        memset(&cv, 0, sizeof cv);
+        ((unsigned char *)&cv)[0] = 0x0d;
+        cv.plain = 0x7f;
+        CHECK(s2c_s_ConstVolatile_get_keep(&cv) == 13);
+        CHECK(cv.plain == 0x7f);
+        CHECK(((const unsigned char *)&cv)[0] == 0x0d);
+        CHECK(sizeof(s2c_s_ConstVolatile) == 2);
+    }
+
+    printf("%s\n", failures ? "edges-failed" : "edges-ok");
+    return failures;
+}
+"#;
+    let stdout = tcc_run(&tcc, &directory, &format!("{source}{consumer}"));
+    assert_eq!(
+        stdout, "edges-ok\n",
+        "the edge consumer reported a mismatch"
     );
 }

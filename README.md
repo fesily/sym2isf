@@ -4,10 +4,12 @@
 extended ISF document format.
 
 It is a frontend only: it reads a debug container, normalizes the records it
-finds, and writes a JSON (or JSON.XZ) document that other tools consume. It
-contains no layout engine, no memory accessor and no virtual-machine bindings, it
-never executes or maps the target program, and it never falls back to Ghidra, a
-Python script or a downloaded symbol server.
+finds, and writes a JSON (or JSON.XZ) document that other tools consume. It can
+also render that document as C declarations (`dwarf-c`, `pdb-c`), which is a
+static memory layout view: the crate still contains no layout engine, no memory
+accessor and no virtual-machine bindings, it never executes or maps the target
+program, and it never falls back to Ghidra, a Python script or a downloaded
+symbol server.
 
 ```
 sym2isf dwarf <image> --output <out.json|out.json.xz>
@@ -15,11 +17,53 @@ sym2isf dwarf <image> --output <out.json|out.json.xz>
 
 sym2isf pdb <file.pdb> --output <out.json|out.json.xz>
     [--image <file.exe|file.dll>] [--image-base <decimal|0xhex>] [--types-only]
+
+sym2isf dwarf-c <image> --type <name> [--type <name> ...] --output <out.c>
+    [--tcc <executable>] [--debug-file <path>] [--architecture <arch>]
+
+sym2isf pdb-c <file.pdb> --type <name> [--type <name> ...] --output <out.c>
+    [--tcc <executable>]
 ```
 
-Exit codes: `0` success, `2` bad arguments, `1` conversion, validation or I/O
-failure. Standard output stays empty on success; the artifact is the only output
-of a successful run, and progress or failure is reported on stderr.
+Exit codes: `0` success, `2` bad arguments, `1` conversion, validation, generation,
+compilation or I/O failure. Standard output stays empty on success; the artifact is
+the only output of a successful run, and progress or failure is reported on stderr.
+
+`dwarf-c` and `pdb-c` read only the type information (no symbols, no functions,
+no address conversion) and publish the C source only after an external TCC
+accepted it: the translation unit is written to a private temporary directory,
+compiled with `tcc -Werror -c`, and only then created at `--output` with
+`create_new`. A missing compiler, a rejected unit or an existing output leaves no
+file behind.
+
+## C declarations
+
+`dwarf-c` and `pdb-c` render the named root types, plus every declaration they
+need, as one self-contained C translation unit that `tcc -c` accepts. It is a
+*memory layout view*: sizes, offsets and bit-field slices are taken from the
+normalized document, never re-derived from an ABI, and the generated code binds no
+symbol and calls no target function.
+
+* Plain members keep direct field access. Each aggregate is emitted inside
+  `#pragma pack(push, 1)` with explicit byte padding, so no target alignment is
+  guessed; `sizeof` and `offsetof` assertions fail the compilation if the document
+  and the compiler disagree.
+* Bit-fields are not C bit-fields. Each one is stored as the exact recorded byte
+  slice and read or written by a generated `static` accessor that touches only the
+  bytes the field covers (`bytes[i]` masks and shifts), so the result cannot depend
+  on a compiler's bit-field allocation rules.
+* Pointer targets that are only pointed at stay forward declarations; typedefs are
+  expanded at their use sites and also emitted as `s2c_a_*` aliases.
+* Little-endian targets with 4- or 8-byte pointers only. The unit refuses a
+  big-endian or unverifiable compiler with `#error`.
+* Records that cannot be described (overlapping members, a complete type of size
+  zero, a non-native pointer width, a scalar width with no fixed-width C type) fail
+  with `CGeneration` and the type or member that caused it; nothing is downgraded
+  to a byte blob unless the document already says the unit is opaque.
+* Root names are the ISF table keys, so `--type Packet` works for a `struct`
+  `Packet` from either frontend. The two frontends are interchangeable: the same
+  fixture and the same layout oracle are checked through both `dwarf-c` and
+  `pdb-c`.
 
 ## Output contract
 

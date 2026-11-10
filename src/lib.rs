@@ -3,8 +3,10 @@
 //! extended ISF document format.
 //!
 //! The crate is a pure frontend: it reads a debug container, normalizes the type
-//! records it finds, and writes a JSON (or JSON.XZ) document. It contains no
-//! layout engine, no memory accessor and no virtual-machine bindings.
+//! records it finds, and writes a JSON (or JSON.XZ) document. It also renders a
+//! normalized document as C declarations ([`c::generate`]), which is a static
+//! memory layout view rather than a layout engine: nothing here maps or reads
+//! target memory, and there are no virtual-machine bindings.
 //!
 //! ```no_run
 //! use std::path::PathBuf;
@@ -20,6 +22,7 @@
 //! document.save(std::path::Path::new("probe.json")).expect("write");
 //! ```
 
+pub mod c;
 pub mod error;
 pub mod isf;
 pub mod normalize;

@@ -23,11 +23,9 @@ object = { version = "0.40", features = ["read", "compression", "std"] }
 pdb = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+tempfile = "3"
 thiserror = "2"
 uuid = "1"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 debug = false
