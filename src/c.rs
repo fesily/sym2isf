@@ -18,13 +18,26 @@ use std::fmt::{self, Write as _};
 use crate::error::{Error, Result};
 use crate::isf::type_size;
 use crate::isf::{
-    BaseKind, CompositeKind, Function as IsfFunction, IntValue, IsfDocument, Parameter, Qualifier,
-    TypeRef, UserType,
+    BaseKind, BaseType, CompositeKind, Function as IsfFunction, IntValue, IsfDocument, Parameter,
+    Qualifier, TypeRef, UserType,
 };
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+/// Which product a translation unit is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    /// A byte-exact memory layout view: prefixed names, packed aggregates and
+    /// `extern` prototypes, with no address unless one is asked for.
+    #[default]
+    Layout,
+    /// An SDK view: source names, ABI-spelled scalars, one `struct s2c_api` of
+    /// function pointers and a binder that asks the caller's resolver for each
+    /// address.
+    Sdk,
+}
 
 /// Which declarations a translation unit should carry.
 ///
@@ -38,8 +51,12 @@ pub struct Request<'a> {
     pub functions: &'a [&'a str],
     /// Select every entry of `functions` instead of naming them.
     pub all_functions: bool,
-    /// Emit the recorded addresses as a static data table.
+    /// Emit the recorded addresses as a static data table (layout view only).
     pub with_addresses: bool,
+    /// Which product to render.
+    pub view: View,
+    /// Allow an aggregate passed or returned by value in the SDK view.
+    pub allow_by_value_aggregates: bool,
 }
 
 impl<'a> Request<'a> {
@@ -157,7 +174,15 @@ pub fn generate(document: &IsfDocument, request: &Request<'_>) -> Result<String>
     }
     walker.drain()?;
 
-    Generator::new(document, walker.used, functions, request.with_addresses)?.emit()
+    Generator::new(
+        document,
+        walker.used,
+        functions,
+        request.with_addresses,
+        request.view,
+        request.allow_by_value_aggregates,
+    )?
+    .emit()
 }
 
 fn cg(loc: &Loc<'_>, detail: impl Into<String>) -> Error {
@@ -629,6 +654,20 @@ fn is_c_keyword(name: &str) -> bool {
     )
 }
 
+/// True when the name is a C identifier at all: `struct _IO_FILE` and
+/// `__int32_t` are real source names an SDK should keep.
+fn is_c_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(byte) if byte == b'_' || byte.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    if !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+        return false;
+    }
+    !is_c_keyword(name)
+}
+
 /// True when the name is an identifier C can declare at file scope without
 /// stepping on the implementation's reserved forms (`_x`, `__x`).
 fn is_spellable_identifier(name: &str) -> bool {
@@ -668,11 +707,16 @@ fn field_identifier(original: &str, used: &mut BTreeSet<String>) -> String {
 }
 
 /// A parameter name, when the document records one that can be spelled in C.
-fn parameter_ident(name: Option<&str>, used: &mut BTreeSet<String>) -> Option<String> {
+fn parameter_ident(
+    name: Option<&str>,
+    used: &mut BTreeSet<String>,
+    forbidden: &BTreeSet<String>,
+) -> Option<String> {
     let name = name?;
-    // An unspellable or repeated name stays abstract: inventing one would hide
-    // the record's own naming instead of declaring it.
-    if !is_plain_identifier(name) || !used.insert(name.to_string()) {
+    // An unspellable name, a repeat, or a spelling the declaration uses as a
+    // type (`f(Packet *Packet, Packet *other)`) stays abstract: a parameter
+    // name is cosmetic and must never hide the type it points at.
+    if !is_plain_identifier(name) || forbidden.contains(name) || !used.insert(name.to_string()) {
         return None;
     }
     Some(name.to_string())
@@ -798,6 +842,15 @@ struct Generator<'a> {
     functions: Vec<String>,
     function_names: BTreeMap<String, String>,
     with_addresses: bool,
+    view: View,
+    image_base: Option<u64>,
+    allow_by_value_aggregates: bool,
+    /// Identifiers the header itself provides (`<stdint.h>` spellings, the guard
+    /// macro); an SDK type name falls back to the prefixed form instead.
+    reserved: BTreeSet<String>,
+    /// Spellings used as types in emitted declarations, so a parameter name can
+    /// never hide one.
+    forbidden: BTreeSet<String>,
 }
 
 impl<'a> Generator<'a> {
@@ -806,6 +859,8 @@ impl<'a> Generator<'a> {
         used: Used,
         functions: Vec<String>,
         with_addresses: bool,
+        request_view: View,
+        request_by_value: bool,
     ) -> Result<Self> {
         let mut generator = Generator {
             doc,
@@ -823,11 +878,18 @@ impl<'a> Generator<'a> {
             functions,
             function_names: BTreeMap::new(),
             with_addresses,
+            view: request_view,
+            image_base: doc.metadata.sym2isf.image_base,
+            allow_by_value_aggregates: request_by_value,
+            reserved: BTreeSet::new(),
+            forbidden: BTreeSet::new(),
         };
+        generator.reserve_header_identifiers();
         // Reserving the prototype names first lets a function keep a name that
         // would otherwise look like one of the generated identifiers.
         generator.function_names = generator.assign_function_names();
         generator.assign_type_names();
+        generator.forbidden = generator.type_spellings();
         generator.compute_layouts()?;
         generator.order = generator.definition_order()?;
         generator.assign_accessors();
@@ -845,10 +907,71 @@ impl<'a> Generator<'a> {
             .is_some_and(|base| base.kind == BaseKind::Void)
     }
 
+    /// Names the generated header imports or defines itself.
+    ///
+    /// An SDK type may legitimately be called `int32_t` or `size_t` in a
+    /// document; emitting it under that name would collide with the includes, so
+    /// those names are reserved and the encoded form is used instead.
+    fn reserve_header_identifiers(&mut self) {
+        if self.view != View::Sdk {
+            return;
+        }
+        for name in [
+            "int8_t",
+            "int16_t",
+            "int32_t",
+            "int64_t",
+            "uint8_t",
+            "uint16_t",
+            "uint32_t",
+            "uint64_t",
+            "intptr_t",
+            "uintptr_t",
+            "size_t",
+            "ptrdiff_t",
+            "float",
+            "double",
+            "void",
+            "S2C_SDK_H",
+            "S2C_LITTLE_ENDIAN",
+        ] {
+            self.reserved.insert(name.to_string());
+        }
+    }
+
+    /// Every spelling the emitted declarations may use as a type.
+    fn type_spellings(&self) -> BTreeSet<String> {
+        if self.view != View::Sdk {
+            return BTreeSet::new();
+        }
+        let mut spellings: BTreeSet<String> = self.reserved.clone();
+        for name in self
+            .base_names
+            .values()
+            .chain(self.aggregate_names.values())
+            .chain(self.enum_names.values())
+            .chain(self.alias_names.values())
+            .chain(self.function_names.values())
+        {
+            spellings.insert(name.clone());
+        }
+        for size in [1u64, 2, 4, 8] {
+            spellings.insert(format!("int{}_t", size * 8));
+            spellings.insert(format!("uint{}_t", size * 8));
+        }
+        spellings
+    }
+
     fn assign_function_names(&mut self) -> BTreeMap<String, String> {
         let mut names = BTreeMap::new();
         for name in self.functions.clone() {
-            let candidate = if is_spellable_identifier(&name) {
+            let spellable = match self.view {
+                View::Layout => is_spellable_identifier(&name),
+                // A struct member lives in its own scope, so the file-scope
+                // reserved forms (`_x`) are fine there.
+                View::Sdk => is_c_identifier(&name) && !self.reserved.contains(&name),
+            };
+            let candidate = if spellable {
                 name.clone()
             } else {
                 format!("s2c_fn_{}", encode(&name))
@@ -859,13 +982,31 @@ impl<'a> Generator<'a> {
         names
     }
 
+    /// The name to try for one declaration.
+    ///
+    /// The layout view always prefixes (it must never collide with a source
+    /// name); the SDK view keeps a name C can spell so the header reads like the
+    /// original source, and falls back to the prefixed form.
+    fn candidate(&self, name: &str, prefix: &str) -> String {
+        match self.view {
+            View::Layout => format!("{prefix}{}", encode(name)),
+            View::Sdk if is_c_identifier(name) && !self.reserved.contains(name) => name.to_string(),
+            View::Sdk => format!("{prefix}{}", encode(name)),
+        }
+    }
+
     fn assign_type_names(&mut self) {
         let scalars: Vec<String> = self.used.scalars.iter().cloned().collect();
         for name in scalars {
             if self.is_void_base(&name) {
                 continue;
             }
-            let candidate = format!("s2c_b_{}", encode(&name));
+            // The SDK view spells scalars with the standard fixed-width types, so
+            // only an opaque unit needs a name there.
+            if self.view == View::Sdk && self.doc.base_types[&name].kind != BaseKind::Opaque {
+                continue;
+            }
+            let candidate = self.candidate(&name, "s2c_b_");
             let assigned = self.unique(&candidate);
             self.base_names.insert(name, assigned);
         }
@@ -884,21 +1025,21 @@ impl<'a> Generator<'a> {
                 CompositeKind::Struct => "s2c_s_",
                 CompositeKind::Union => "s2c_u_",
             };
-            let candidate = format!("{prefix}{}", encode(&name));
+            let candidate = self.candidate(&name, prefix);
             let assigned = self.unique(&candidate);
             self.aggregate_names.insert(name, assigned);
         }
 
         let enums: Vec<String> = self.used.enums.iter().cloned().collect();
         for name in enums {
-            let candidate = format!("s2c_e_{}", encode(&name));
+            let candidate = self.candidate(&name, "s2c_e_");
             let assigned = self.unique(&candidate);
             self.enum_names.insert(name, assigned);
         }
 
         let aliases: Vec<String> = self.used.aliases.iter().cloned().collect();
         for name in aliases {
-            let candidate = format!("s2c_a_{}", encode(&name));
+            let candidate = self.candidate(&name, "s2c_a_");
             let assigned = self.unique(&candidate);
             self.alias_names.insert(name, assigned);
         }
@@ -1222,6 +1363,8 @@ impl<'a> Generator<'a> {
                     .ok_or_else(|| cg(loc, format!("missing base type `{name}`")))?;
                 let text = if base.kind == BaseKind::Void {
                     "void".to_string()
+                } else if self.view == View::Sdk && base.kind != BaseKind::Opaque {
+                    self.sdk_scalar(base, name)?
                 } else {
                     self.base_names.get(name).cloned().ok_or_else(|| {
                         cg(
@@ -1529,15 +1672,28 @@ impl<'a> Generator<'a> {
 
     fn emit(mut self) -> Result<String> {
         let mut out = String::new();
+        if self.view == View::Sdk {
+            line(&mut out, format_args!("#ifndef S2C_SDK_H"));
+            line(&mut out, format_args!("#define S2C_SDK_H"));
+            blank(&mut out);
+        }
         self.emit_header(&mut out);
         self.emit_forwards(&mut out);
         self.emit_scalars(&mut out)?;
         self.emit_aggregates(&mut out)?;
         self.emit_aliases(&mut out)?;
-        self.emit_prototypes(&mut out)?;
-        self.emit_addresses(&mut out)?;
+        match self.view {
+            View::Layout => {
+                self.emit_prototypes(&mut out)?;
+                self.emit_addresses(&mut out)?;
+            }
+            View::Sdk => self.emit_api(&mut out)?,
+        }
         self.emit_assertions(&mut out)?;
         self.emit_accessors(&mut out)?;
+        if self.view == View::Sdk {
+            line(&mut out, format_args!("#endif /* S2C_SDK_H */"));
+        }
         Ok(out)
     }
 
@@ -1547,7 +1703,13 @@ impl<'a> Generator<'a> {
         let pointer_size = target.pointer_size;
         line(
             out,
-            format_args!("/* generated by sym2isf: layout view of an extended ISF document */"),
+            format_args!(
+                "/* generated by sym2isf: {} view of an extended ISF document */",
+                match self.view {
+                    View::Layout => "layout",
+                    View::Sdk => "SDK",
+                }
+            ),
         );
         line(
             out,
@@ -1634,6 +1796,13 @@ impl<'a> Generator<'a> {
                 continue;
             }
             let base = &self.doc.base_types[&name];
+            if self.view == View::Sdk && base.kind != BaseKind::Opaque {
+                // No typedef is emitted for a scalar, but a selected unit is
+                // still validated: a width, endian or alignment the SDK cannot
+                // spell must fail instead of being silently skipped.
+                let _ = self.sdk_scalar(base, &name)?;
+                continue;
+            }
             let identifier = self.base_names[&name].clone();
             let alignment = check_alignment(base.alignment, base.size, &name)?;
             let attribute = alignment
@@ -1650,13 +1819,25 @@ impl<'a> Generator<'a> {
                     out,
                     format_args!("/* base type {name_text} is a byte blob: {reason} */"),
                 );
-                line(
-                    out,
-                    format_args!(
-                        "typedef struct {{ unsigned char s2c_storage[{}]; }} {identifier}{attribute};",
-                        base.size
-                    ),
-                );
+                // The layout view keeps its historical anonymous struct; the SDK
+                // view names the tag so `struct Name` works as well as `Name`.
+                if self.view == View::Sdk {
+                    line(
+                        out,
+                        format_args!(
+                            "typedef struct {identifier} {{ unsigned char bytes[{}]; }} {identifier}{attribute};",
+                            base.size
+                        ),
+                    );
+                } else {
+                    line(
+                        out,
+                        format_args!(
+                            "typedef struct {{ unsigned char s2c_storage[{}]; }} {identifier}{attribute};",
+                            base.size
+                        ),
+                    );
+                }
             } else {
                 let text = self.scalar_text(&name)?;
                 let name_text = comment_text(&name);
@@ -1674,6 +1855,74 @@ impl<'a> Generator<'a> {
         }
         blank(out);
         Ok(())
+    }
+
+    /// The standard C spelling of a base unit in the SDK view.
+    ///
+    /// The layout view needs a named typedef so the type name is stable and
+    /// unique; an SDK header reads better with `int32_t` directly.
+    fn sdk_scalar(&self, base: &BaseType, name: &str) -> Result<String> {
+        let loc = Loc::Type(name);
+        if base.endian.is_big() {
+            return Err(cg(
+                &loc,
+                "big-endian scalars cannot be described as little-endian C objects",
+            ));
+        }
+        // A recorded alignment cannot be spelled on a standard scalar type, and
+        // silently dropping it would change the type the SDK promises.
+        if check_alignment(base.alignment, base.size, name)?.is_some() {
+            return Err(cg(
+                &loc,
+                "an explicitly aligned scalar cannot be spelled with the standard C types",
+            ));
+        }
+        match base.kind {
+            BaseKind::Opaque => Err(cg(&loc, "opaque base type is not a scalar")),
+            BaseKind::Void => Ok("void".to_string()),
+            BaseKind::Float => match base.size {
+                4 => Ok("float".to_string()),
+                8 => Ok("double".to_string()),
+                other => Err(cg(
+                    &loc,
+                    format!("floating point width {other} bytes has no C type"),
+                )),
+            },
+            BaseKind::Pointer => {
+                if base.size != self.pointer_size {
+                    return Err(cg(
+                        &loc,
+                        format!(
+                            "pointer unit is {} bytes but the target pointer is {} bytes",
+                            base.size, self.pointer_size
+                        ),
+                    ));
+                }
+                Ok("uintptr_t".to_string())
+            }
+            // A character unit keeps a character spelling (`int8_t` is a distinct
+            // type from `char`). A frontend that normalizes `char` to a 1-byte
+            // integer still spells `int8_t`: the record no longer distinguishes
+            // `char` from `signed char`, and the storage is identical.
+            BaseKind::Char if base.size == 1 => Ok(if base.signed {
+                "char".to_string()
+            } else {
+                "unsigned char".to_string()
+            }),
+            BaseKind::Bool | BaseKind::Char | BaseKind::Int => {
+                if !matches!(base.size, 1 | 2 | 4 | 8) {
+                    return Err(cg(
+                        &loc,
+                        format!("scalar width {} bytes has no fixed-width C type", base.size),
+                    ));
+                }
+                let bits = base.size * 8;
+                Ok(format!(
+                    "{}{bits}_t",
+                    if base.signed { "int" } else { "uint" }
+                ))
+            }
+        }
     }
 
     fn scalar_text(&self, name: &str) -> Result<String> {
@@ -1832,6 +2081,12 @@ impl<'a> Generator<'a> {
             let ctype = self.ctype(target, &mut Vec::new(), &loc)?;
             let identifier = &self.alias_names[&name];
             let declaration = declare(&ctype, identifier);
+            // `typedef int32_t int32_t;` declares nothing: the source alias
+            // already uses the spelling the expansion produces.
+            let parts: Vec<&str> = declaration.split_whitespace().collect();
+            if parts.len() == 2 && parts[0] == identifier && parts[1] == identifier {
+                continue;
+            }
             let name_text = comment_text(&name);
             line(out, format_args!("/* alias {name_text} -> {identifier} */"));
             line(out, format_args!("typedef {declaration};"));
@@ -1841,7 +2096,7 @@ impl<'a> Generator<'a> {
     }
 
     fn emit_prototypes(&mut self, out: &mut String) -> Result<()> {
-        if self.functions.is_empty() {
+        if self.view != View::Layout || self.functions.is_empty() {
             return Ok(());
         }
         line(
@@ -1855,7 +2110,9 @@ impl<'a> Generator<'a> {
             let names: Vec<Option<String>> = function
                 .parameters
                 .iter()
-                .map(|parameter| parameter_ident(parameter.name.as_deref(), &mut scope))
+                .map(|parameter| {
+                    parameter_ident(parameter.name.as_deref(), &mut scope, &self.forbidden)
+                })
                 .collect();
             let (ret, parameters, variadic) = self.signature_parts(
                 &function.return_type,
@@ -1873,6 +2130,207 @@ impl<'a> Generator<'a> {
             line(out, format_args!("/* function {} */", comment_text(&name)));
             line(out, format_args!("extern {declaration};"));
         }
+        blank(out);
+        Ok(())
+    }
+
+    /// Reject a signature the ABI-correct call path cannot express.
+    fn check_callable(&self, function: &IsfFunction, loc: &Loc<'_>) -> Result<()> {
+        // x86-64 has one integer/SSE convention; a 32-bit target has several and
+        // the attribute for them is not emitted yet.
+        if self.pointer_size == 4 {
+            if let Some(convention) = &function.calling_convention {
+                if !matches!(convention.as_str(), "near_cdecl" | "cdecl" | "none") {
+                    return Err(cg(
+                        loc,
+                        format!("calling convention `{convention}` is not supported yet"),
+                    ));
+                }
+            }
+        }
+        if !self.allow_by_value_aggregates {
+            if let Some(aggregate) = self.by_value_aggregate(&function.return_type, 0) {
+                return Err(cg(
+                    loc,
+                    format!(
+                        "returns aggregate `{aggregate}` by value; pass it by pointer or allow by-value aggregates"
+                    ),
+                ));
+            }
+            for parameter in &function.parameters {
+                if let Some(aggregate) = self.by_value_aggregate(&parameter.ty, 0) {
+                    return Err(cg(
+                        loc,
+                        format!(
+                            "takes aggregate `{aggregate}` by value; pass it by pointer or allow by-value aggregates"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The aggregate a reference passes by value, if any. An array parameter
+    /// decays to a pointer, so its element type is not passed by value.
+    fn by_value_aggregate(&self, ty: &TypeRef, depth: usize) -> Option<String> {
+        if depth > self.doc.typedefs.len() + 1 {
+            return None;
+        }
+        match ty {
+            TypeRef::Struct { name, .. } | TypeRef::Union { name, .. } => Some(name.clone()),
+            // An opaque unit is published as a struct, so passing it by value is
+            // the same unproven ABI assumption.
+            TypeRef::Base { name, .. } => self
+                .doc
+                .base_types
+                .get(name)
+                .filter(|base| base.kind == BaseKind::Opaque)
+                .map(|_| name.clone()),
+            TypeRef::Typedef { name, .. } => self
+                .doc
+                .typedefs
+                .get(name)
+                .and_then(|target| self.by_value_aggregate(target, depth + 1)),
+            _ => None,
+        }
+    }
+
+    /// `struct s2c_api` of function pointers plus the binder that fills it.
+    ///
+    /// Nothing is linked: every member is looked up through the caller's
+    /// resolver by source name and recorded offset, so the header works for a
+    /// module at any load address.
+    fn emit_api(&mut self, out: &mut String) -> Result<()> {
+        if self.view != View::Sdk {
+            return Ok(());
+        }
+        if self.functions.is_empty() {
+            return Err(cg(
+                &Loc::Functions,
+                "the SDK view needs at least one selected function",
+            ));
+        }
+        struct Member {
+            source: String,
+            identifier: String,
+            declaration: String,
+            cast: String,
+            rva: u64,
+        }
+        let mut members: Vec<Member> = Vec::with_capacity(self.functions.len());
+        for name in self.functions.clone() {
+            let function: IsfFunction = self.doc.functions[&name].clone();
+            let loc = Loc::Function(&name);
+            self.check_callable(&function, &loc)?;
+            let (ret, parameters, variadic) = self.signature_parts(
+                &function.return_type,
+                &function.parameters,
+                function.variadic,
+                &[],
+                &mut Vec::new(),
+                &loc,
+            )?;
+            let pointer = CType::Pointer(
+                Box::new(CType::Function(Box::new(ret), parameters, variadic)),
+                Vec::new(),
+            );
+            let identifier = self.function_names[&name].clone();
+            // The member renders like the source prototype, parameter names
+            // included, so the API reads like the original header.
+            let mut scope: BTreeSet<String> = BTreeSet::new();
+            let names: Vec<Option<String>> = function
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    parameter_ident(parameter.name.as_deref(), &mut scope, &self.forbidden)
+                })
+                .collect();
+            let address = function
+                .address
+                .ok_or_else(|| cg(&loc, "no recorded address"))?;
+            let rva = match self.image_base {
+                Some(base) if address >= base => address - base,
+                Some(base) => {
+                    return Err(cg(
+                        &loc,
+                        format!("address {address:#x} is below image base {base:#x}"),
+                    ));
+                }
+                None => address,
+            };
+            members.push(Member {
+                source: name.clone(),
+                declaration: declare_with_names(&pointer, &identifier, Some(&names)),
+                cast: declare(&pointer, ""),
+                identifier,
+                rva,
+            });
+        }
+
+        let record = self.unique("s2c_api");
+        line(
+            out,
+            format_args!("/* every callable entry point, resolved at run time */"),
+        );
+        line(out, format_args!("struct {record} {{"));
+        for member in &members {
+            line(
+                out,
+                format_args!("    {}; /* {} */", member.declaration, member.identifier),
+            );
+        }
+        line(out, format_args!("}};"));
+        line(out, format_args!("typedef struct {record} {record};"));
+        blank(out);
+        // Resolution is the caller's business: the header only states what it
+        // needs (the source name and the recorded offset) and binds what the
+        // callback returns. It never computes a module address itself.
+        let entry = self.unique("s2c_entry");
+        let resolver = self.unique("s2c_resolver");
+        line(
+            out,
+            format_args!("/* one callable address, and the caller's resolver */"),
+        );
+        line(out, format_args!("typedef void (*{entry})(void);"));
+        line(
+            out,
+            format_args!("typedef {entry} (*{resolver})(const char *name, uintptr_t offset);"),
+        );
+        blank(out);
+        let bind = self.unique("s2c_bind");
+        // Allocated, not spelled literally: a document may name a type `api` or
+        // `resolve`, and a parameter would hide it inside the binder.
+        let api_parameter = self.unique("api");
+        let resolve_parameter = self.unique("resolve");
+        line(
+            out,
+            format_args!("/* a NULL result leaves the member NULL; the binder never calls it */"),
+        );
+        line(
+            out,
+            format_args!(
+                "static inline void {bind}(struct {record} *{api_parameter}, {resolver} {resolve_parameter})"
+            ),
+        );
+        line(out, format_args!("{{"));
+        for member in &members {
+            let constant = if self.pointer_size == 8 {
+                format!("0x{:016x}ULL", member.rva)
+            } else {
+                format!("0x{:08x}U", member.rva)
+            };
+            line(
+                out,
+                format_args!(
+                    "    {api_parameter}->{} = ({}) {resolve_parameter}({}, (uintptr_t){constant});",
+                    member.identifier,
+                    member.cast,
+                    c_string(&member.source)
+                ),
+            );
+        }
+        line(out, format_args!("}}"));
         blank(out);
         Ok(())
     }
@@ -1935,6 +2393,10 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let base = &self.doc.base_types[&name];
+                // Only the units that got a typedef need an assertion here.
+                if self.view == View::Sdk && base.kind != BaseKind::Opaque {
+                    continue;
+                }
                 let identifier = self.base_names[&name].clone();
                 conditions.push(format!("sizeof({identifier}) == {}", base.size));
                 if let Some(alignment) = check_alignment(base.alignment, base.size, &name)? {
@@ -1985,6 +2447,15 @@ impl<'a> Generator<'a> {
         );
     }
 
+    /// `static inline` in a header (an unused accessor must not warn), `static`
+    /// in the compiled layout unit, whose bytes are part of the shipped output.
+    fn accessor_linkage(&self) -> &'static str {
+        match self.view {
+            View::Layout => "static",
+            View::Sdk => "static inline",
+        }
+    }
+
     fn emit_accessors(&self, out: &mut String) -> Result<()> {
         if self.accessors.is_empty() {
             return Ok(());
@@ -2032,11 +2503,12 @@ impl<'a> Generator<'a> {
         } else {
             "uint64_t"
         };
+        let linkage = self.accessor_linkage();
         let field_text = comment_text(&bitfield.field);
         line(out, format_args!("/* field {field_text} */"));
         line(
             out,
-            format_args!("static {ret} {name}(const {cv}{aggregate_name} *p)"),
+            format_args!("{linkage} {ret} {name}(const {cv}{aggregate_name} *p)"),
         );
         line(out, format_args!("{{"));
         line(
@@ -2092,11 +2564,12 @@ impl<'a> Generator<'a> {
         } else {
             "uint64_t"
         };
+        let linkage = self.accessor_linkage();
         let field_text = comment_text(&bitfield.field);
         line(out, format_args!("/* field {field_text} (write) */"));
         line(
             out,
-            format_args!("static void {name}({cv}{aggregate_name} *p, {argument} value)"),
+            format_args!("{linkage} void {name}({cv}{aggregate_name} *p, {argument} value)"),
         );
         line(out, format_args!("{{"));
         line(
@@ -2123,7 +2596,7 @@ impl<'a> Generator<'a> {
             line(
                 out,
                 format_args!(
-                    "    bytes[{}] = (unsigned char)((bytes[{}] & 0x{:02x}U) | {update});",
+                    "    bytes[{}] = (unsigned char)((bytes[{}] & 0x{:02x}U) | ({update}));",
                     chunk.byte, chunk.byte, keep
                 ),
             );

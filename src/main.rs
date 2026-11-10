@@ -13,8 +13,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitCode};
 
-use clap::{ArgGroup, Parser, Subcommand};
-use sym2isf::c::Request;
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use sym2isf::c::{Request, View};
 use sym2isf::{DebugInput, Detail, Error, Result, convert};
 
 #[derive(Parser)]
@@ -27,6 +27,15 @@ use sym2isf::{DebugInput, Detail, Error, Result, convert};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Which product a C subcommand writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Emit {
+    /// Byte-exact memory layout with prefixed names and `extern` prototypes.
+    Layout,
+    /// Source names plus one `struct s2c_api` of function pointers and a binder.
+    Sdk,
 }
 
 #[derive(Subcommand)]
@@ -88,9 +97,20 @@ enum Command {
         /// Declare every function signature in the input.
         #[arg(long)]
         all_functions: bool,
-        /// Emit the recorded function addresses as a static data table.
+        /// Emit the recorded addresses as a static data table (layout view only).
         #[arg(long, requires = "function_selection")]
         with_addresses: bool,
+        /// Product to write: the layout view (default) or a callable SDK.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = Emit::Layout,
+            requires_if("sdk", "function_selection")
+        )]
+        emit: Emit,
+        /// Allow aggregates passed or returned by value (SDK view only).
+        #[arg(long)]
+        allow_by_value_aggregates: bool,
         /// Output path for the generated C source; `.c` is recommended.
         #[arg(long)]
         output: PathBuf,
@@ -127,9 +147,20 @@ enum Command {
         /// Declare every function signature in the input.
         #[arg(long)]
         all_functions: bool,
-        /// Emit the recorded function addresses as a static data table.
+        /// Emit the recorded addresses as a static data table (layout view only).
         #[arg(long, requires = "function_selection")]
         with_addresses: bool,
+        /// Product to write: the layout view (default) or a callable SDK.
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = Emit::Layout,
+            requires_if("sdk", "function_selection")
+        )]
+        emit: Emit,
+        /// Allow aggregates passed or returned by value (SDK view only).
+        #[arg(long)]
+        allow_by_value_aggregates: bool,
         /// Output path for the generated C source; `.c` is recommended.
         #[arg(long)]
         output: PathBuf,
@@ -181,6 +212,8 @@ fn main() -> ExitCode {
             functions,
             all_functions,
             with_addresses,
+            emit,
+            allow_by_value_aggregates,
             output,
             tcc,
             image,
@@ -193,13 +226,19 @@ fn main() -> ExitCode {
                 functions: &function_refs,
                 all_functions,
                 with_addresses,
+                view: view_for(emit),
+                allow_by_value_aggregates,
             };
             run_c(
                 DebugInput::Pdb {
                     pdb,
                     image,
                     image_base,
-                    detail: detail_for(with_addresses, !functions.is_empty() || all_functions),
+                    detail: detail_for(
+                        emit,
+                        with_addresses,
+                        !functions.is_empty() || all_functions,
+                    ),
                 },
                 &request,
                 &output,
@@ -212,6 +251,8 @@ fn main() -> ExitCode {
             functions,
             all_functions,
             with_addresses,
+            emit,
+            allow_by_value_aggregates,
             output,
             tcc,
             debug_file,
@@ -224,13 +265,19 @@ fn main() -> ExitCode {
                 functions: &function_refs,
                 all_functions,
                 with_addresses,
+                view: view_for(emit),
+                allow_by_value_aggregates,
             };
             run_c(
                 DebugInput::Dwarf {
                     image,
                     debug_file,
                     architecture,
-                    detail: detail_for(with_addresses, !functions.is_empty() || all_functions),
+                    detail: detail_for(
+                        emit,
+                        with_addresses,
+                        !functions.is_empty() || all_functions,
+                    ),
                 },
                 &request,
                 &output,
@@ -312,13 +359,22 @@ fn run_convert(command: Command) -> Result<()> {
 ///
 /// Declaring a function needs its signature but no address, so asking for
 /// functions stays on `Signatures`; only the address table needs `Full`.
-fn detail_for(with_addresses: bool, functions: bool) -> Detail {
-    if with_addresses {
+fn detail_for(emit: Emit, with_addresses: bool, functions: bool) -> Detail {
+    // The SDK view hands every member's offset to the caller's resolver, so it
+    // always needs the recorded addresses; the layout view keeps them optional.
+    if emit == Emit::Sdk || with_addresses {
         Detail::Full
     } else if functions {
         Detail::Signatures
     } else {
         Detail::TypesOnly
+    }
+}
+
+fn view_for(emit: Emit) -> View {
+    match emit {
+        Emit::Layout => View::Layout,
+        Emit::Sdk => View::Sdk,
     }
 }
 

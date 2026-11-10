@@ -3417,3 +3417,239 @@ fn dwarf_c_tcc_functions() {
     assert_eq!(declared, expected, "--all-functions declares every entry");
     global_symbols(&tcc, &nm, &directory, &all, "all");
 }
+
+// ---------------------------------------------------------------------------
+// SDK view: a callable struct of pointers, resolved from a module base
+// ---------------------------------------------------------------------------
+
+/// Build a shared object from the probe fixture. The SDK view binds a module
+/// base, so the target has to be loadable with `dlopen`.
+#[cfg(target_os = "linux")]
+fn build_shared_probe(directory: &Path, compiler: &Path) -> PathBuf {
+    let object = directory.join("shared.o");
+    compile(
+        Command::new(compiler)
+            .args([
+                "-O0",
+                "-g",
+                "-gdwarf-4",
+                "-fno-eliminate-unused-debug-types",
+                "-fPIC",
+                "-c",
+            ])
+            .arg(PROBE_C)
+            .arg("-o")
+            .arg(&object),
+    );
+    let library = directory.join("libprobe.so");
+    compile(
+        Command::new(compiler)
+            .arg("-shared")
+            .arg(&object)
+            .arg("-o")
+            .arg(&library),
+    );
+    library
+}
+
+/// Calls the target through the generated struct, never through a symbol.
+#[cfg(target_os = "linux")]
+const SDK_CONSUMER: &str = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include "sdk.h"
+
+static int failures = 0;
+static int resolve_failures = 0;
+static uintptr_t module_base;
+#define CHECK(condition) do { if (!(condition)) { printf("failed: %s\n", #condition); failures = 1; } } while (0)
+
+/* The caller's resolver: the header asks by source name, we answer with the
+   module base plus the offset it recorded. A hardcoded answer would do here. */
+static s2c_entry resolve_entry(const char *name, uintptr_t offset)
+{
+    if (strcmp(name, "packet_callback") != 0 && strcmp(name, "endian_name") != 0) {
+        resolve_failures = 1;
+    }
+    return (s2c_entry)(module_base + offset);
+}
+
+int main(int argc, char **argv)
+{
+    void *handle;
+    void *anchor;
+    Dl_info info;
+    struct s2c_api api;
+    struct Packet packet;
+    const char *endian;
+    int32_t result;
+
+    CHECK(argc == 2);
+    handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    CHECK(handle != 0);
+    /* Any exported symbol of the module gives its load bias. */
+    anchor = dlsym(handle, "packet_global");
+    CHECK(anchor != 0);
+    CHECK(dladdr(anchor, &info) != 0);
+    module_base = (uintptr_t)info.dli_fbase;
+    s2c_bind(&api, resolve_entry);
+    CHECK(resolve_failures == 0);
+    CHECK(api.packet_callback != 0);
+    CHECK(api.endian_name != 0);
+
+    memset(&packet, 0, sizeof packet);
+    packet.value = 5;
+    result = api.packet_callback(&packet, 3);
+    CHECK(result == 8);
+    CHECK(packet.value == 8);
+
+    endian = api.endian_name();
+    CHECK(endian != 0);
+    CHECK(strcmp(endian, "little") == 0);
+
+    printf("%s\n", failures ? "sdk-failed" : "sdk-ok");
+    return failures;
+}
+"#;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dwarf_c_sdk_round_trip() {
+    let Some(cc) = tool("cc") else { return };
+    let Some(tcc) = tool("tcc") else { return };
+    let directory = tempdir("dwarf-c-sdk");
+    let library = build_shared_probe(&directory, &cc);
+
+    let header = directory.join("sdk.h");
+    let result = c_args(
+        "dwarf-c",
+        &library,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("sdk"),
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            // Bit-fields bring the generated accessors into the header.
+            OsStr::new("--type"),
+            OsStr::new("Bits"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--function"),
+            OsStr::new("endian_name"),
+        ],
+        &header,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(result.stdout.is_empty(), "{}", result.describe());
+    let source = std::fs::read_to_string(&header).expect("sdk header");
+    assert!(source.contains("struct s2c_api {"), "{source}");
+    assert!(
+        source.contains("static inline void s2c_bind(struct s2c_api *api, s2c_resolver resolve)"),
+        "{source}"
+    );
+    assert!(!source.contains("extern "), "{source}");
+    // Resolution is injected; the header passes the name and the recorded offset.
+    assert!(
+        source.contains("resolve(\"packet_callback\", (uintptr_t)0x"),
+        "{source}"
+    );
+
+    // A header is included by a consumer, not compiled as its own unit: it must
+    // be clean under a strict real compiler, including accessors nobody calls.
+    let probe = directory.join("header-only.c");
+    std::fs::write(&probe, "#include \"sdk.h\"\nint main(void) { return 0; }\n")
+        .expect("header probe");
+    let compiled = Command::new(&cc)
+        .args(["-Wall", "-Wextra", "-Werror", "-c"])
+        .arg("-I")
+        .arg(&directory)
+        .arg(&probe)
+        .arg("-o")
+        .arg(directory.join("header-only.o"))
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", cc.display()));
+    assert!(
+        compiled.status.success(),
+        "the SDK header is not warning-clean: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let consumer = directory.join("consumer.c");
+    std::fs::write(&consumer, SDK_CONSUMER).expect("consumer");
+    let output = Command::new(&tcc)
+        .arg("-Werror")
+        .arg(format!("-I{}", directory.display()))
+        .arg("-run")
+        .arg(&consumer)
+        .arg(&library)
+        .current_dir(&directory)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", tcc.display()));
+    assert!(
+        output.status.success(),
+        "SDK consumer failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "sdk-ok\n",
+        "the SDK consumer reported a mismatch"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pdb_c_sdk_offsets_are_relative_to_the_image_base() {
+    let Some(directory) = pdb_artifacts() else {
+        return;
+    };
+    let Some(tcc) = tool("tcc") else { return };
+    let pdb = directory.join("probe.pdb");
+    let image = directory.join("probe.exe");
+    let scratch = tempdir("pdb-c-sdk");
+
+    let header = scratch.join("sdk.h");
+    let result = c_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--emit"),
+            OsStr::new("sdk"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--image"),
+            image.as_os_str(),
+        ],
+        &header,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let source = std::fs::read_to_string(&header).expect("sdk header");
+    assert!(!source.contains("extern "), "{source}");
+
+    // The offset is the recorded address minus the image base, not the address.
+    let json = scratch.join("probe.json");
+    assert!(convert_pdb(&pdb, &json, &["--image", image.to_str().unwrap()]).success());
+    let document = load_document(&json);
+    let address = document["functions"]["packet_callback"]["address"]
+        .as_u64()
+        .expect("recorded address");
+    let base = document["metadata"]["sym2isf"]["image_base"]
+        .as_u64()
+        .expect("image base");
+    let offset = address - base;
+    assert!(
+        source.contains(&format!(
+            "resolve(\"packet_callback\", (uintptr_t)0x{offset:016x}ULL)"
+        )),
+        "expected offset {offset:#x} in {source}"
+    );
+    assert!(
+        !source.contains(&format!("(uintptr_t)0x{address:016x}ULL")),
+        "the absolute address must not be passed: {source}"
+    );
+}

@@ -18,12 +18,14 @@ sym2isf dwarf <image> --output <out.json|out.json.xz>
 sym2isf pdb <file.pdb> --output <out.json|out.json.xz>
     [--image <file.exe|file.dll>] [--image-base <decimal|0xhex>] [--types-only]
 
-sym2isf dwarf-c <image> --output <out.c>
+sym2isf dwarf-c <image> --output <out.c|out.h>
     (--type <name> | --function <name>) ... [--all-functions] [--with-addresses]
+    [--emit <layout|sdk>] [--allow-by-value-aggregates]
     [--tcc <executable>] [--debug-file <path>] [--architecture <arch>]
 
-sym2isf pdb-c <file.pdb> --output <out.c>
+sym2isf pdb-c <file.pdb> --output <out.c|out.h>
     (--type <name> | --function <name>) ... [--all-functions] [--with-addresses]
+    [--emit <layout|sdk>] [--allow-by-value-aggregates]
     [--tcc <executable>] [--image <file.exe>] [--image-base <decimal|0xhex>]
 ```
 
@@ -80,6 +82,47 @@ symbol and calls no target function.
   `Packet` from either frontend. The two frontends are interchangeable: the same
   fixture and the same layout oracle are checked through both `dwarf-c` and
   `pdb-c`.
+
+### SDK view
+
+`--emit sdk` writes a callable header instead of a layout view. Nothing is
+linked and nothing is declared for a linker to resolve: the unit carries the
+types under their **source** names, one `struct s2c_api` whose members are
+function pointers, and a binder that asks **the caller** to resolve each name:
+
+```c
+typedef void (*s2c_entry)(void);
+typedef s2c_entry (*s2c_resolver)(const char *name, uintptr_t offset);
+
+static inline void s2c_bind(struct s2c_api *api, s2c_resolver resolve)
+{
+    api->packet_callback =
+        (int32_t (*)(Packet *, int32_t)) resolve("packet_callback", (uintptr_t)0x1179ULL);
+}
+```
+
+* The header never computes an address. `resolve` receives the **source name**
+  (the table key, even when the C member had to be encoded) and the recorded
+  offset, and returns the address to store; `NULL` leaves the member `NULL`.
+  A caller can answer from `dlsym`/`GetProcAddress`, from `module_base + offset`,
+  or from a hardcoded table — the generated code is identical.
+* The offset is `image_base ? address - image_base : address`, so it is relative
+  to the load base for a PDB and already module-relative for a shared object.
+  `--emit sdk` always converts with addresses, so a PDB needs `--image` or
+  `--image-base`.
+* Scalars use the standard fixed-width types (`int32_t`, `uint8_t`, `float`,
+  `double`, `uintptr_t`); a character unit keeps a character spelling
+  (`char` / `unsigned char`). Aggregates keep their source tags; an enum becomes a
+  fixed-width typedef plus its constants; a name C cannot spell falls back to the
+  `s2c_*` encoded form. `typedef T T;` tautologies are dropped, and a name the
+  includes already define (`int32_t`, `size_t`, the header guard) is never used.
+* An explicitly aligned scalar unit is refused: the standard types cannot carry
+  the attribute, and dropping it would change the type the header promises.
+* An aggregate passed or returned **by value** is refused: the packed layout view
+  is not an ABI promise. `--allow-by-value-aggregates` emits it anyway.
+* A non-default calling convention on a 32-bit target is refused until the
+  attribute is emitted; x86-64 has a single convention and ignores the name.
+* `--emit layout` (the default) is unchanged, including `--with-addresses`.
 
 ## Output contract
 
