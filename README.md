@@ -5,8 +5,8 @@ extended ISF document format.
 
 It is a frontend only: it reads a debug container, normalizes the records it
 finds, and writes a JSON (or JSON.XZ) document that other tools consume. It can
-also render that document as C declarations (`dwarf-c`, `pdb-c`), which is a
-static memory layout view: the crate still contains no layout engine, no memory
+also render that document as C declarations — types and function signatures
+(`dwarf-c`, `pdb-c`) — which is a static memory layout view: the crate still contains no layout engine, no memory
 accessor and no virtual-machine bindings, it never executes or maps the target
 program, and it never falls back to Ghidra, a Python script or a downloaded
 symbol server.
@@ -18,11 +18,13 @@ sym2isf dwarf <image> --output <out.json|out.json.xz>
 sym2isf pdb <file.pdb> --output <out.json|out.json.xz>
     [--image <file.exe|file.dll>] [--image-base <decimal|0xhex>] [--types-only]
 
-sym2isf dwarf-c <image> --type <name> [--type <name> ...] --output <out.c>
+sym2isf dwarf-c <image> --output <out.c>
+    (--type <name> | --function <name>) ... [--all-functions] [--with-addresses]
     [--tcc <executable>] [--debug-file <path>] [--architecture <arch>]
 
-sym2isf pdb-c <file.pdb> --type <name> [--type <name> ...] --output <out.c>
-    [--tcc <executable>]
+sym2isf pdb-c <file.pdb> --output <out.c>
+    (--type <name> | --function <name>) ... [--all-functions] [--with-addresses]
+    [--tcc <executable>] [--image <file.exe>] [--image-base <decimal|0xhex>]
 ```
 
 Exit codes: `0` success, `2` bad arguments, `1` conversion, validation, generation,
@@ -38,8 +40,9 @@ file behind.
 
 ## C declarations
 
-`dwarf-c` and `pdb-c` render the named root types, plus every declaration they
-need, as one self-contained C translation unit that `tcc -c` accepts. It is a
+`dwarf-c` and `pdb-c` render the selected types and functions, plus every
+declaration they need, as one self-contained C translation unit that `tcc -c`
+accepts. It is a
 *memory layout view*: sizes, offsets and bit-field slices are taken from the
 normalized document, never re-derived from an ABI, and the generated code binds no
 symbol and calls no target function.
@@ -56,6 +59,19 @@ symbol and calls no target function.
   expanded at their use sites and also emitted as `s2c_a_*` aliases.
 * Little-endian targets with 4- or 8-byte pointers only. The unit refuses a
   big-endian or unverifiable compiler with `#error`.
+* Functions are declared, never bound: `--function` / `--all-functions` emit
+  `extern` prototypes. A name C can spell is kept verbatim so a consumer can match
+  it against its own declaration; anything else becomes an encoded `s2c_fn_*`
+  identifier and a comment keeps the original. Parameter names are kept when the
+  document records them and they are legal. `calling_convention` is not emitted as
+  an attribute: the unit promises no ABI, and none of this makes the generated
+  object export a symbol.
+* A function selector reads signatures only, so no address is formed and `pdb-c`
+  needs neither `--image` nor `--image-base`; an unlinked `dwarf-c` object works
+  too. `--with-addresses` switches to a full conversion and adds a `static const`
+  name/address table for the selected functions. That table is data: no
+  `address(N)` attribute, no `asm` label, no runtime binding, and a function whose
+  record has no address is reported in a comment rather than given one.
 * Records that cannot be described (overlapping members, a complete type of size
   zero, a non-native pointer width, a scalar width with no fixed-width C type) fail
   with `CGeneration` and the type or member that caused it; nothing is downgraded

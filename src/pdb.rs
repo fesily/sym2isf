@@ -45,7 +45,7 @@ pub(crate) fn convert(
     pdb_path: &Path,
     image: Option<&Path>,
     image_base: Option<u64>,
-    types_only: bool,
+    detail: crate::Detail,
 ) -> Result<IsfDocument> {
     let file = std::fs::File::open(pdb_path).map_err(|e| Error::io(pdb_path, e))?;
     let mut pdb = PDB::open(BufReader::new(file)).map_err(|e| pdb_error(pdb_path, e))?;
@@ -103,7 +103,7 @@ pub(crate) fn convert(
             }
         }
     }
-    if !types_only && base.is_none() {
+    if detail.needs_addresses() && base.is_none() {
         return Err(Error::MissingImageBase);
     }
 
@@ -158,21 +158,26 @@ pub(crate) fn convert(
     resolver.prepare_domains(&pending.modules);
     resolver.resolve_all()?;
     // Aliases (`S_UDT`) are type information, so they are always collected; only
-    // object and procedure symbols need addresses.
-    if types_only {
-        apply_pending(&mut resolver, pending, None, true)?;
+    // addresses need a linked image and an image base.
+    let address_map = if detail.needs_addresses() {
+        Some(pdb.address_map().map_err(|e| pdb_error(pdb_path, e))?)
     } else {
-        let address_map = pdb.address_map().map_err(|e| pdb_error(pdb_path, e))?;
-        let base = base.ok_or(Error::MissingImageBase)?;
-        apply_pending(&mut resolver, pending, Some((&address_map, base)), false)?;
-    }
+        None
+    };
+    let addresses = match (&address_map, base) {
+        (Some(map), Some(base)) => Some((map, base)),
+        (Some(_), None) => return Err(Error::MissingImageBase),
+        _ => None,
+    };
+    apply_pending(&mut resolver, pending, addresses, detail)?;
     let Resolver {
         graph,
         symbols,
         functions,
         ..
     } = resolver;
-    let document = graph.emit(base, symbols, functions)?;
+    let image_base = if detail.needs_addresses() { base } else { None };
+    let document = graph.emit(image_base, symbols, functions)?;
     document.validate()?;
     Ok(document)
 }
@@ -1894,7 +1899,7 @@ fn apply_pending<'t>(
     resolver: &mut Resolver<'t>,
     pending: Pending,
     addresses: Option<(&AddressMap<'_>, u64)>,
-    types_only: bool,
+    detail: crate::Detail,
 ) -> Result<()> {
     for symbol in pending.symbols {
         match symbol {
@@ -1924,7 +1929,7 @@ fn apply_pending<'t>(
                 type_index,
                 offset,
             } => {
-                if name.is_empty() || types_only {
+                if name.is_empty() || !detail.wants_symbols() {
                     continue;
                 }
                 let ty = if type_index == 0 {
@@ -1944,7 +1949,7 @@ fn apply_pending<'t>(
                 offset,
                 function,
             } => {
-                if name.is_empty() || function || types_only {
+                if name.is_empty() || function || !detail.wants_symbols() {
                     continue;
                 }
                 let address = absolute_address(offset, addresses);
@@ -1955,7 +1960,7 @@ fn apply_pending<'t>(
                 type_index,
                 offset,
             } => {
-                if name.is_empty() || types_only {
+                if name.is_empty() || !detail.wants_functions() {
                     continue;
                 }
                 let address = absolute_address(offset, addresses);

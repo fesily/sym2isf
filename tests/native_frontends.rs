@@ -2075,6 +2075,74 @@ fn c_source(
     cli(args)
 }
 
+/// Run one C command with arbitrary selection arguments.
+fn c_args(subcommand: &str, input: &Path, args: &[&OsStr], output: &Path, tcc: &Path) -> CliOutput {
+    let mut argv: Vec<std::ffi::OsString> = vec![subcommand.into(), input.as_os_str().to_owned()];
+    argv.extend(args.iter().map(|value| value.to_os_string()));
+    argv.push("--output".into());
+    argv.push(output.as_os_str().to_owned());
+    argv.push("--tcc".into());
+    argv.push(tcc.as_os_str().to_owned());
+    cli(argv)
+}
+
+/// Compile one translation unit with TCC and return the global symbols it exports.
+#[cfg(target_os = "linux")]
+fn global_symbols(tcc: &Path, nm: &Path, directory: &Path, source: &str, tag: &str) -> Vec<String> {
+    let path = directory.join(format!("{tag}.c"));
+    std::fs::write(&path, source).expect("source");
+    let object = directory.join(format!("{tag}.o"));
+    let compiled = Command::new(tcc)
+        .args(["-Werror", "-c"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&object)
+        .current_dir(directory)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", tcc.display()));
+    assert!(
+        compiled.status.success(),
+        "tcc rejected the unit: {}
+{}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let listed = Command::new(nm)
+        .arg("-g")
+        .arg(&object)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", nm.display()));
+    assert!(listed.status.success(), "nm failed on {}", object.display());
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.ends_with(':'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Compile one translation unit with TCC without linking it.
+#[cfg(target_os = "linux")]
+fn tcc_compile_only(tcc: &Path, directory: &Path, source: &str, tag: &str) {
+    let path = directory.join(format!("{tag}.c"));
+    std::fs::write(&path, source).expect("source");
+    let object = directory.join(format!("{tag}.o"));
+    let compiled = Command::new(tcc)
+        .args(["-Werror", "-c"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&object)
+        .current_dir(directory)
+        .output()
+        .unwrap_or_else(|e| panic!("cannot run {}: {e}", tcc.display()));
+    assert!(
+        compiled.status.success(),
+        "tcc rejected {tag}: {}\n{}",
+        String::from_utf8_lossy(&compiled.stdout),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
 /// Compile and run a consumer translation unit with TCC, returning stdout.
 #[cfg(target_os = "linux")]
 fn tcc_run(tcc: &Path, directory: &Path, source: &str) -> String {
@@ -2814,6 +2882,26 @@ fn edge_document() -> IsfDocument {
             ],
         ),
     );
+    // A function whose return type needs parentheses in the declarator.
+    document.functions.insert(
+        "factory".to_string(),
+        sym2isf::isf::Function {
+            address: None,
+            return_type: pointer_to(TypeRef::Function {
+                return_type: Box::new(reference("int32_t")),
+                parameters: vec![sym2isf::Parameter {
+                    name: None,
+                    ty: reference("int32_t"),
+                }],
+                variadic: None,
+                calling_convention: None,
+                qualifiers: Vec::new(),
+            }),
+            parameters: Vec::new(),
+            variadic: None,
+            calling_convention: None,
+        },
+    );
     document.enums.insert(
         "Wide".to_string(),
         sym2isf::isf::EnumType {
@@ -2837,15 +2925,19 @@ fn c_generation_tcc_edges() {
     let document = edge_document();
     let source = sym2isf::c::generate(
         &document,
-        &[
-            "Edge",
-            "SignedBits64",
-            "UnsignedBits64",
-            "ConstVolatile",
-            "Factory",
-            "A",
-            "A2",
-        ],
+        &sym2isf::c::Request {
+            types: &[
+                "Edge",
+                "SignedBits64",
+                "UnsignedBits64",
+                "ConstVolatile",
+                "Factory",
+                "A",
+                "A2",
+            ],
+            functions: &["factory"],
+            ..sym2isf::c::Request::default()
+        },
     )
     .expect("the edge document is describable");
     assert!(
@@ -2867,6 +2959,7 @@ static int failures = 0;
 static int32_t plus_one(int32_t value) { return value + 1; }
 static int32_t *make_value(void) { return 0; }
 static void take_rows(s2c_s_Zed2 (*rows)[2]) { (void)rows; }
+
 
 int main(void)
 {
@@ -2991,9 +3084,336 @@ int main(void)
     return failures;
 }
 "#;
+    // A prototype is a declaration, so it can only be type-checked at compile
+    // time: a function returning a pointer to a function keeps the parameter
+    // list of the outer function, and the assignment below fails otherwise.
+    tcc_compile_only(
+        &tcc,
+        &directory,
+        &format!(
+            "{source}\n\
+             typedef int32_t (*s2c_expected_inner)(int32_t);\n\
+             typedef s2c_expected_inner (*s2c_expected_factory)(void);\n\
+             s2c_expected_factory s2c_factory_check = factory;\n"
+        ),
+        "factory",
+    );
     let stdout = tcc_run(&tcc, &directory, &format!("{source}{consumer}"));
     assert_eq!(
         stdout, "edges-ok\n",
         "the edge consumer reported a mismatch"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Function declarations in C, checked by a real TCC
+// ---------------------------------------------------------------------------
+
+/// A consumer that checks the declared prototype against an independently
+/// written type: assigning the function to a pointer of the expected shape, and
+/// defining it with the same signature, both fail to compile if the declared
+/// types disagree. The document name is kept verbatim, so this is the
+/// type-equivalence proof.
+#[cfg(target_os = "linux")]
+const FUNCTION_DEFINITION: &str = r#"
+#include <stdint.h>
+
+typedef int32_t (*s2c_expected_callback)(s2c_s_Packet *, int32_t);
+s2c_expected_callback s2c_expected_callback_value = packet_callback;
+
+int32_t packet_callback(s2c_s_Packet *packet, int32_t delta)
+{
+    packet->value += delta;
+    return packet->value;
+}
+"#;
+
+#[cfg(target_os = "linux")]
+fn address_consumer(address: u64, name: &str) -> String {
+    format!(
+        r#"
+#include <stdio.h>
+#include <string.h>
+
+static int failures = 0;
+#define CHECK(condition) do {{ if (!(condition)) {{ printf("failed: %s\n", #condition); failures = 1; }} }} while (0)
+
+int main(void)
+{{
+    const uint64_t expected = 0x{address:016x}ULL;
+    size_t index;
+    int found = 0;
+    for (index = 0; index < sizeof(s2c_addresses) / sizeof(s2c_addresses[0]); index++) {{
+        if (strcmp(s2c_addresses[index].name, "{name}") == 0) {{
+            found = 1;
+            CHECK(s2c_addresses[index].address == expected);
+        }}
+    }}
+    CHECK(found);
+    printf("%s\n", failures ? "addresses-failed" : "addresses-ok");
+    return failures;
+}}
+"#
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pdb_c_tcc_functions() {
+    let Some(directory) = pdb_artifacts() else {
+        return;
+    };
+    let Some(tcc) = tool("tcc") else { return };
+    let Some(nm) = tool("nm") else { return };
+    let oracle = {
+        let text = std::fs::read_to_string(directory.join("oracle.json")).expect("oracle");
+        Oracle::parse(&text)
+    };
+    let pdb = directory.join("probe.pdb");
+    let scratch = tempdir("pdb-c-functions");
+
+    // A signature needs no address, so this runs without an image or base.
+    let source_path = scratch.join("fn.c");
+    let result = c_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+        ],
+        &source_path,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    assert!(result.stdout.is_empty(), "{}", result.describe());
+    let source = std::fs::read_to_string(&source_path).expect("generated source");
+    assert!(source.contains("extern "), "{source}");
+    assert!(!source.contains("s2c_addresses"), "{source}");
+
+    // The unit itself exports nothing: no prototype becomes a bound symbol.
+    let symbols = global_symbols(&tcc, &nm, &scratch, &source, "generated");
+    assert!(symbols.is_empty(), "unexpected exports: {symbols:?}");
+
+    // The prototype's types match a real definition, and leaving it out of the
+    // unit would not; TCC reports conflicting types otherwise.
+    global_symbols(
+        &tcc,
+        &nm,
+        &scratch,
+        &format!("{source}{FUNCTION_DEFINITION}"),
+        "definition",
+    );
+
+    // Selector order and duplicates are not part of the output.
+    let reordered = scratch.join("fn-reordered.c");
+    let again = c_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--function"),
+            OsStr::new("main"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--function"),
+            OsStr::new("main"),
+        ],
+        &reordered,
+        &tcc,
+    );
+    assert!(again.success(), "{}", again.describe());
+    let forward = c_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--function"),
+            OsStr::new("main"),
+        ],
+        &scratch.join("fn-forward.c"),
+        &tcc,
+    );
+    assert!(forward.success(), "{}", forward.describe());
+    assert_eq!(
+        std::fs::read(&reordered).unwrap(),
+        std::fs::read(scratch.join("fn-forward.c")).unwrap(),
+        "selector order does not change the generated bytes"
+    );
+
+    // The recorded address is opt-in and needs the image.
+    let with_addresses = scratch.join("fn-addresses.c");
+    let result = c_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--with-addresses"),
+            OsStr::new("--image"),
+            directory.join("probe.exe").as_os_str(),
+        ],
+        &with_addresses,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let table = std::fs::read_to_string(&with_addresses).expect("address table source");
+    let consumer = address_consumer(oracle.addresses["packet_callback"], "packet_callback");
+    let stdout = tcc_run(&tcc, &scratch, &format!("{table}{consumer}"));
+    assert_eq!(stdout, "addresses-ok\n", "the address table is wrong");
+
+    // Without an image base there are no addresses, and nothing is published.
+    let no_base = scratch.join("fn-no-base.c");
+    let result = c_args(
+        "pdb-c",
+        &pdb,
+        &[
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--with-addresses"),
+        ],
+        &no_base,
+        &tcc,
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(
+        result.stderr.contains("MissingImageBase"),
+        "{}",
+        result.stderr
+    );
+    assert!(!no_base.exists(), "no source without addresses");
+
+    // An unknown selector is a typed failure and publishes nothing.
+    let unknown = scratch.join("fn-unknown.c");
+    let result = c_args(
+        "pdb-c",
+        &pdb,
+        &[OsStr::new("--function"), OsStr::new("no_such_function")],
+        &unknown,
+        &tcc,
+    );
+    assert_eq!(result.status, Some(1), "{}", result.describe());
+    assert!(result.stderr.contains("CGeneration"), "{}", result.stderr);
+    assert!(
+        result.stderr.contains("function `no_such_function`"),
+        "{}",
+        result.stderr
+    );
+    assert!(!unknown.exists(), "no source for a rejected selection");
+}
+
+/// `Signatures` collects what a declaration needs and nothing that needs an
+/// address, so it works without an image base.
+#[cfg(unix)]
+#[test]
+fn signature_mode_drops_addresses() {
+    use sym2isf::{DebugInput, Detail};
+
+    let Some(cc) = tool("cc") else { return };
+    let directory = tempdir("signatures");
+    build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    // The object carries the DWARF on every host (on macOS the linked image does
+    // not), and an unlinked object is exactly what a signature-only conversion
+    // must handle without addresses.
+    let object = directory.join("probe.o");
+    let document = sym2isf::convert(&DebugInput::Dwarf {
+        image: object,
+        debug_file: None,
+        architecture: None,
+        detail: Detail::Signatures,
+    })
+    .expect("a signatures conversion");
+    assert!(!document.functions.is_empty(), "signatures are collected");
+    assert!(
+        document
+            .functions
+            .values()
+            .all(|entry| entry.address.is_none()),
+        "no function carries an address"
+    );
+    assert!(document.symbols.is_empty(), "object symbols stay out");
+    assert!(
+        document.metadata.sym2isf.image_base.is_none(),
+        "no image base is claimed"
+    );
+    document.validate().expect("the document validates");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dwarf_c_tcc_functions() {
+    let Some(cc) = tool("cc") else { return };
+    let Some(tcc) = tool("tcc") else { return };
+    let Some(nm) = tool("nm") else { return };
+    let directory = tempdir("dwarf-c-functions");
+    let binary = build_host_probe(&directory, &cc, "probe", &["-gdwarf-4"]);
+    let oracle = Oracle::parse(&run_binary(&binary));
+
+    let source_path = directory.join("fn.c");
+    let result = c_args(
+        "dwarf-c",
+        &binary,
+        &[
+            OsStr::new("--type"),
+            OsStr::new("Packet"),
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+        ],
+        &source_path,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let source = std::fs::read_to_string(&source_path).expect("generated source");
+    let symbols = global_symbols(&tcc, &nm, &directory, &source, "generated");
+    assert!(symbols.is_empty(), "unexpected exports: {symbols:?}");
+    global_symbols(
+        &tcc,
+        &nm,
+        &directory,
+        &format!("{source}{FUNCTION_DEFINITION}"),
+        "definition",
+    );
+
+    // DWARF carries addresses itself, so no image base is needed here.
+    let with_addresses = directory.join("fn-addresses.c");
+    let result = c_args(
+        "dwarf-c",
+        &binary,
+        &[
+            OsStr::new("--function"),
+            OsStr::new("packet_callback"),
+            OsStr::new("--with-addresses"),
+        ],
+        &with_addresses,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let table = std::fs::read_to_string(&with_addresses).expect("address table source");
+    let consumer = address_consumer(oracle.addresses["packet_callback"], "packet_callback");
+    let stdout = tcc_run(&tcc, &directory, &format!("{table}{consumer}"));
+    assert_eq!(stdout, "addresses-ok\n", "the address table is wrong");
+
+    // `--all-functions` declares exactly the document's table.
+    let json = directory.join("probe.json");
+    assert!(convert_binary(&binary, &json).success());
+    let document = load_document(&json);
+    let expected = document["functions"].as_object().expect("functions").len();
+    assert!(expected >= 4, "the probe records its functions: {expected}");
+    let every = directory.join("fn-all.c");
+    let result = c_args(
+        "dwarf-c",
+        &binary,
+        &[OsStr::new("--all-functions")],
+        &every,
+        &tcc,
+    );
+    assert!(result.success(), "{}", result.describe());
+    let all = std::fs::read_to_string(&every).expect("all functions source");
+    let declared = all
+        .lines()
+        .filter(|line| line.starts_with("extern "))
+        .count();
+    assert_eq!(declared, expected, "--all-functions declares every entry");
+    global_symbols(&tcc, &nm, &directory, &all, "all");
 }

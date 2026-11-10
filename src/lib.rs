@@ -16,7 +16,7 @@
 //!     image: PathBuf::from("probe"),
 //!     debug_file: None,
 //!     architecture: None,
-//!     types_only: false,
+//!     detail: sym2isf::Detail::Full,
 //! };
 //! let document = convert(&input).expect("conversion");
 //! document.save(std::path::Path::new("probe.json")).expect("write");
@@ -43,6 +43,38 @@ pub use normalize::{
     QualifiedRecord, TypeGraph, TypeId, TypedefRecord, bitfield_slice,
 };
 
+/// How much of the input a conversion publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Detail {
+    /// Types only: no symbols, no functions, no address conversion.
+    TypesOnly,
+    /// Types and function signatures, with no address on any record.
+    ///
+    /// Declaring a function needs its signature, not its location, so this mode
+    /// works without an image base and on an unlinked object.
+    Signatures,
+    /// Types, function signatures, object symbols and addresses.
+    Full,
+}
+
+impl Detail {
+    /// True when addresses must be formed. A PDB then needs an image base and a
+    /// relocatable object cannot provide one.
+    pub fn needs_addresses(self) -> bool {
+        matches!(self, Detail::Full)
+    }
+
+    /// True when procedure records are collected.
+    pub fn wants_functions(self) -> bool {
+        !matches!(self, Detail::TypesOnly)
+    }
+
+    /// True when object and public symbol records are collected.
+    pub fn wants_symbols(self) -> bool {
+        matches!(self, Detail::Full)
+    }
+}
+
 /// A conversion request.
 ///
 /// The format is chosen by the caller, never by sniffing the host operating
@@ -57,8 +89,8 @@ pub enum DebugInput {
         debug_file: Option<PathBuf>,
         /// Architecture to select from a multi-slice container.
         architecture: Option<String>,
-        /// Emit types only: no symbols, no functions.
-        types_only: bool,
+        /// How much of the input to publish.
+        detail: Detail,
     },
     /// Native PDB input.
     Pdb {
@@ -68,8 +100,8 @@ pub enum DebugInput {
         image: Option<PathBuf>,
         /// Explicit image base overriding the preferred one.
         image_base: Option<u64>,
-        /// Emit types only: no symbols, no functions, no address conversion.
-        types_only: bool,
+        /// How much of the input to publish.
+        detail: Detail,
     },
 }
 
@@ -83,18 +115,18 @@ pub fn convert(input: &DebugInput) -> Result<IsfDocument> {
             image,
             debug_file,
             architecture,
-            types_only,
+            detail,
         } => dwarf::convert(
             image,
             debug_file.as_deref(),
             architecture.as_deref(),
-            *types_only,
+            *detail,
         ),
         DebugInput::Pdb {
             pdb,
             image,
             image_base,
-            types_only,
-        } => pdb::convert(pdb, image.as_deref(), *image_base, *types_only),
+            detail,
+        } => pdb::convert(pdb, image.as_deref(), *image_base, *detail),
     }
 }

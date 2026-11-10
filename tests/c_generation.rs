@@ -64,7 +64,8 @@ fn user(kind: CompositeKind, size: u64, fields: Vec<(&str, Field)>) -> UserType 
 }
 
 fn c_error(document: &IsfDocument, roots: &[&str]) -> String {
-    let error = sym2isf::c::generate(document, roots).expect_err("generation must fail");
+    let error = sym2isf::c::generate(document, &sym2isf::c::Request::types(roots))
+        .expect_err("generation must fail");
     assert_eq!(error.kind(), "CGeneration", "{error:?}");
     error.to_string()
 }
@@ -82,7 +83,7 @@ fn roots_are_required_and_must_resolve_to_one_table() {
         "{message}"
     );
     assert!(
-        message.contains("at least one root type is required"),
+        message.contains("at least one root type or function is required"),
         "{message}"
     );
 
@@ -178,7 +179,8 @@ fn complete_zero_sized_aggregates_are_refused() {
     let mut empty = user(CompositeKind::Struct, 0, Vec::new());
     empty.incomplete = Some(true);
     declared.user_types.insert("Declared".to_string(), empty);
-    let source = sym2isf::c::generate(&declared, &["Declared"]).expect("declaration only");
+    let source = sym2isf::c::generate(&declared, &sym2isf::c::Request::types(&["Declared"]))
+        .expect("declaration only");
     assert!(source.contains("s2c_s_Declared"), "{source}");
     assert!(!source.contains("sizeof(s2c_s_Declared)"), "{source}");
 }
@@ -307,7 +309,8 @@ fn invalid_parameter_lists_and_restrict_are_refused() {
             )],
         ),
     );
-    sym2isf::c::generate(&sole_void, &["SoleVoid"]).expect("a lone void parameter is a prototype");
+    sym2isf::c::generate(&sole_void, &sym2isf::c::Request::types(&["SoleVoid"]))
+        .expect("a lone void parameter is a prototype");
 
     // A typedef hides nothing: `restrict` on a function pointer is still invalid.
     let mut restricted = empty_document();
@@ -403,7 +406,7 @@ fn extreme_but_valid_records_are_reported_not_overflowed() {
             )],
         ),
     );
-    let source = sym2isf::c::generate(&extreme, &["HugeBits"])
+    let source = sym2isf::c::generate(&extreme, &sym2isf::c::Request::types(&["HugeBits"]))
         .expect("a far but valid offset is not an overflow");
     assert!(
         source.contains("s2c_s_HugeBits"),
@@ -442,8 +445,10 @@ fn output_is_a_pure_function_of_the_document() {
             vec![("other", field(0, reference("int32_t")))],
         ),
     );
-    let forward = sym2isf::c::generate(&document, &["A", "B"]).expect("roots");
-    let reversed = sym2isf::c::generate(&document, &["B", "A", "A"]).expect("roots");
+    let forward =
+        sym2isf::c::generate(&document, &sym2isf::c::Request::types(&["A", "B"])).expect("roots");
+    let reversed = sym2isf::c::generate(&document, &sym2isf::c::Request::types(&["B", "A", "A"]))
+        .expect("roots");
     assert_eq!(forward, reversed, "root order and duplicates do not matter");
     assert!(forward.ends_with('\n'), "the unit ends with a newline");
     assert!(

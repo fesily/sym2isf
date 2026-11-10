@@ -65,7 +65,7 @@ pub(crate) fn convert(
     image: &Path,
     debug_file: Option<&Path>,
     architecture: Option<&str>,
-    types_only: bool,
+    detail: crate::Detail,
 ) -> Result<IsfDocument> {
     let image_bytes = std::fs::read(image).map_err(|e| Error::io(image, e))?;
     let (image_slice, slice_arch) = select_slice(&image_bytes, architecture, image)?;
@@ -101,7 +101,7 @@ pub(crate) fn convert(
             });
         }
     }
-    if image_file.kind() == ObjectKind::Relocatable && !types_only {
+    if image_file.kind() == ObjectKind::Relocatable && detail.needs_addresses() {
         return Err(Error::UnlinkedImage { path: image.into() });
     }
     let endian = if image_file.is_little_endian() {
@@ -192,9 +192,7 @@ pub(crate) fn convert(
     };
     frontend.collect_all()?;
     frontend.resolve_all()?;
-    if !types_only {
-        frontend.collect_globals()?;
-    }
+    frontend.collect_globals(detail)?;
     let Frontend {
         graph,
         symbols,
@@ -1968,7 +1966,9 @@ impl<'a> Frontend<'a> {
 
     // -- globals ----------------------------------------------------------
 
-    fn collect_globals(&mut self) -> Result<()> {
+    fn collect_globals(&mut self, detail: crate::Detail) -> Result<()> {
+        let symbols = detail.wants_symbols();
+        let functions = detail.wants_functions();
         let keys: Vec<DieKey> = self.index.keys().copied().collect();
         for key in keys {
             let die = match self.index.get(&key) {
@@ -1976,8 +1976,10 @@ impl<'a> Frontend<'a> {
                 None => continue,
             };
             match die.tag {
-                constants::DW_TAG_variable => self.collect_variable(key, &die)?,
-                constants::DW_TAG_subprogram => self.collect_subprogram(key, &die)?,
+                constants::DW_TAG_variable if symbols => self.collect_variable(key, &die)?,
+                constants::DW_TAG_subprogram if functions => {
+                    self.collect_subprogram(key, &die, detail.needs_addresses())?
+                }
                 _ => {}
             }
         }
@@ -2045,11 +2047,22 @@ impl<'a> Frontend<'a> {
         }
     }
 
-    fn collect_subprogram(&mut self, key: DieKey, die: &DieData<'a>) -> Result<()> {
+    fn collect_subprogram(
+        &mut self,
+        key: DieKey,
+        die: &DieData<'a>,
+        addresses: bool,
+    ) -> Result<()> {
         if !self.is_global_scope(die) {
             return Ok(());
         }
-        let address = self.function_address(die);
+        // A signature request deliberately records no location, even when the
+        // image could supply one.
+        let address = if addresses {
+            self.function_address(die)
+        } else {
+            None
+        };
         if die.flag(constants::DW_AT_declaration) && address.is_none() {
             return Ok(());
         }

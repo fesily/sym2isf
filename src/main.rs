@@ -13,8 +13,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, ExitCode};
 
-use clap::{Parser, Subcommand};
-use sym2isf::{DebugInput, Error, Result, convert};
+use clap::{ArgGroup, Parser, Subcommand};
+use sym2isf::c::Request;
+use sym2isf::{DebugInput, Detail, Error, Result, convert};
 
 #[derive(Parser)]
 #[command(
@@ -64,27 +65,71 @@ enum Command {
         #[arg(long)]
         types_only: bool,
     },
-    /// Declare PDB types as C and publish the source only once TCC accepts it.
+    /// Declare PDB types and functions as C, checked by TCC before it is published.
+    #[command(group(
+        ArgGroup::new("selection")
+            .required(true)
+            .multiple(true)
+            .args(["types", "functions", "all_functions"])
+    ), group(
+        ArgGroup::new("function_selection")
+            .multiple(true)
+            .args(["functions", "all_functions"])
+    ))]
     PdbC {
         /// The `.pdb` file.
         pdb: PathBuf,
-        /// Root type to declare; repeat the option for every root.
-        #[arg(long = "type", value_name = "NAME", required = true)]
+        /// Root type to declare, as named in the ISF tables; repeat per root.
+        #[arg(long = "type", value_name = "NAME")]
         types: Vec<String>,
+        /// Function to declare, as named in the ISF table; repeat per function.
+        #[arg(long = "function", value_name = "NAME")]
+        functions: Vec<String>,
+        /// Declare every function signature in the input.
+        #[arg(long)]
+        all_functions: bool,
+        /// Emit the recorded function addresses as a static data table.
+        #[arg(long, requires = "function_selection")]
+        with_addresses: bool,
         /// Output path for the generated C source; `.c` is recommended.
         #[arg(long)]
         output: PathBuf,
         /// TCC executable used to compile-check the generated translation unit.
         #[arg(long, default_value = "tcc")]
         tcc: PathBuf,
+        /// PE image used for the preferred image base and the build id check.
+        #[arg(long)]
+        image: Option<PathBuf>,
+        /// Explicit image base, decimal or `0x`-prefixed hexadecimal.
+        #[arg(long, value_parser = parse_u64)]
+        image_base: Option<u64>,
     },
-    /// Declare DWARF types as C and publish the source only once TCC accepts it.
+    /// Declare DWARF types and functions as C, checked by TCC before it is published.
+    #[command(group(
+        ArgGroup::new("selection")
+            .required(true)
+            .multiple(true)
+            .args(["types", "functions", "all_functions"])
+    ), group(
+        ArgGroup::new("function_selection")
+            .multiple(true)
+            .args(["functions", "all_functions"])
+    ))]
     DwarfC {
         /// Image: executable, shared object, relocatable object or .dSYM bundle.
         image: PathBuf,
-        /// Root type to declare; repeat the option for every root.
-        #[arg(long = "type", value_name = "NAME", required = true)]
+        /// Root type to declare, as named in the ISF tables; repeat per root.
+        #[arg(long = "type", value_name = "NAME")]
         types: Vec<String>,
+        /// Function to declare, as named in the ISF table; repeat per function.
+        #[arg(long = "function", value_name = "NAME")]
+        functions: Vec<String>,
+        /// Declare every function signature in the input.
+        #[arg(long)]
+        all_functions: bool,
+        /// Emit the recorded function addresses as a static data table.
+        #[arg(long, requires = "function_selection")]
+        with_addresses: bool,
         /// Output path for the generated C source; `.c` is recommended.
         #[arg(long)]
         output: PathBuf,
@@ -133,37 +178,65 @@ fn main() -> ExitCode {
         Command::PdbC {
             pdb,
             types,
+            functions,
+            all_functions,
+            with_addresses,
             output,
             tcc,
-        } => run_c(
-            DebugInput::Pdb {
-                pdb,
-                image: None,
-                image_base: None,
-                types_only: true,
-            },
-            &types,
-            &output,
-            &tcc,
-        ),
+            image,
+            image_base,
+        } => {
+            let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
+            let function_refs: Vec<&str> = functions.iter().map(String::as_str).collect();
+            let request = Request {
+                types: &type_refs,
+                functions: &function_refs,
+                all_functions,
+                with_addresses,
+            };
+            run_c(
+                DebugInput::Pdb {
+                    pdb,
+                    image,
+                    image_base,
+                    detail: detail_for(with_addresses, !functions.is_empty() || all_functions),
+                },
+                &request,
+                &output,
+                &tcc,
+            )
+        }
         Command::DwarfC {
             image,
             types,
+            functions,
+            all_functions,
+            with_addresses,
             output,
             tcc,
             debug_file,
             architecture,
-        } => run_c(
-            DebugInput::Dwarf {
-                image,
-                debug_file,
-                architecture,
-                types_only: true,
-            },
-            &types,
-            &output,
-            &tcc,
-        ),
+        } => {
+            let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
+            let function_refs: Vec<&str> = functions.iter().map(String::as_str).collect();
+            let request = Request {
+                types: &type_refs,
+                functions: &function_refs,
+                all_functions,
+                with_addresses,
+            };
+            run_c(
+                DebugInput::Dwarf {
+                    image,
+                    debug_file,
+                    architecture,
+                    detail: detail_for(with_addresses, !functions.is_empty() || all_functions),
+                },
+                &request,
+                &output,
+                &tcc,
+            )
+        }
         command => run_convert(command),
     };
     match outcome {
@@ -189,7 +262,11 @@ fn run_convert(command: Command) -> Result<()> {
                 image,
                 debug_file,
                 architecture,
-                types_only,
+                detail: if types_only {
+                    Detail::TypesOnly
+                } else {
+                    Detail::Full
+                },
             },
             output,
         ),
@@ -204,7 +281,11 @@ fn run_convert(command: Command) -> Result<()> {
                 pdb,
                 image,
                 image_base,
-                types_only,
+                detail: if types_only {
+                    Detail::TypesOnly
+                } else {
+                    Detail::Full
+                },
             },
             output,
         ),
@@ -227,13 +308,26 @@ fn run_convert(command: Command) -> Result<()> {
     Ok(())
 }
 
-/// Convert `input` to types only, render C for the named roots, compile it with
-/// TCC, then publish it.
+/// The conversion detail that can supply what the request asks for.
+///
+/// Declaring a function needs its signature but no address, so asking for
+/// functions stays on `Signatures`; only the address table needs `Full`.
+fn detail_for(with_addresses: bool, functions: bool) -> Detail {
+    if with_addresses {
+        Detail::Full
+    } else if functions {
+        Detail::Signatures
+    } else {
+        Detail::TypesOnly
+    }
+}
+
+/// Render C for the request, compile it with TCC, then publish it.
 ///
 /// The output is only created after TCC accepted the translation unit, and the
 /// source is written with `create_new`, so a failed run never leaves a partial
 /// or unverified file behind.
-fn run_c(input: DebugInput, roots: &[String], output: &Path, tcc: &Path) -> Result<()> {
+fn run_c(input: DebugInput, request: &Request<'_>, output: &Path, tcc: &Path) -> Result<()> {
     match std::fs::symlink_metadata(output) {
         Ok(_) => {
             return Err(Error::OutputExists {
@@ -245,8 +339,7 @@ fn run_c(input: DebugInput, roots: &[String], output: &Path, tcc: &Path) -> Resu
     }
 
     let document = convert(&input)?;
-    let references: Vec<&str> = roots.iter().map(String::as_str).collect();
-    let source = sym2isf::c::generate(&document, &references)?;
+    let source = sym2isf::c::generate(&document, request)?;
 
     let program = compiler_program(tcc);
     let directory = tempfile::Builder::new()

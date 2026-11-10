@@ -17,19 +17,48 @@ use std::fmt::{self, Write as _};
 
 use crate::error::{Error, Result};
 use crate::isf::type_size;
-use crate::isf::{BaseKind, CompositeKind, IntValue, IsfDocument, Qualifier, TypeRef, UserType};
+use crate::isf::{
+    BaseKind, CompositeKind, Function as IsfFunction, IntValue, IsfDocument, Parameter, Qualifier,
+    TypeRef, UserType,
+};
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Render a self-contained C translation unit describing `roots` and every
-/// declaration they need.
+/// Which declarations a translation unit should carry.
 ///
-/// Every root must name exactly one entry of `base_types`, `user_types`,
-/// `enums` or `typedefs`. The result is a pure function of the document and the
-/// root set: the order in which roots are passed does not change the output.
-pub fn generate(document: &IsfDocument, roots: &[&str]) -> Result<String> {
+/// Selection is by exact table key, never by prefix or fuzzy match, and the
+/// order in which names are given never changes the output.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Request<'a> {
+    /// Root type names: keys of `base_types`, `user_types`, `enums` or `typedefs`.
+    pub types: &'a [&'a str],
+    /// Function names: keys of `functions`.
+    pub functions: &'a [&'a str],
+    /// Select every entry of `functions` instead of naming them.
+    pub all_functions: bool,
+    /// Emit the recorded addresses as a static data table.
+    pub with_addresses: bool,
+}
+
+impl<'a> Request<'a> {
+    /// A request for the given types and nothing else.
+    pub fn types(types: &'a [&'a str]) -> Self {
+        Request {
+            types,
+            ..Request::default()
+        }
+    }
+}
+
+/// Render a self-contained C translation unit for one [`Request`].
+///
+/// Every selected type must name exactly one entry of `base_types`,
+/// `user_types`, `enums` or `typedefs`, and every selected function one entry of
+/// `functions`. The result is a pure function of the document and the request:
+/// the order in which names are given does not change the output.
+pub fn generate(document: &IsfDocument, request: &Request<'_>) -> Result<String> {
     document.validate()?;
     let target = &document.metadata.sym2isf.target;
     if target.endian.is_big() {
@@ -47,13 +76,22 @@ pub fn generate(document: &IsfDocument, roots: &[&str]) -> Result<String> {
             ),
         ));
     }
-    if roots.is_empty() {
-        return Err(cg(&Loc::Roots, "at least one root type is required"));
+    if request.with_addresses && request.functions.is_empty() && !request.all_functions {
+        return Err(cg(
+            &Loc::Functions,
+            "an address table needs at least one selected function",
+        ));
+    }
+    if request.types.is_empty() && request.functions.is_empty() && !request.all_functions {
+        return Err(cg(
+            &Loc::Roots,
+            "at least one root type or function is required",
+        ));
     }
 
     let mut walker = Walker::new(document);
     let mut selected: BTreeSet<&str> = BTreeSet::new();
-    selected.extend(roots.iter().copied());
+    selected.extend(request.types.iter().copied());
     for name in selected {
         let mut tables = 0usize;
         if document.base_types.contains_key(name) {
@@ -90,7 +128,36 @@ pub fn generate(document: &IsfDocument, roots: &[&str]) -> Result<String> {
     }
     walker.drain()?;
 
-    Generator::new(document, walker.used)?.emit()
+    let mut functions: Vec<String> = Vec::new();
+    if request.all_functions {
+        functions.extend(document.functions.keys().cloned());
+    }
+    functions.extend(request.functions.iter().map(|name| (*name).to_string()));
+    functions.sort();
+    functions.dedup();
+    let wanted_functions = request.all_functions || !request.functions.is_empty();
+    if wanted_functions && document.functions.is_empty() {
+        return Err(cg(
+            &Loc::Functions,
+            "the document carries no function signatures; convert without types-only",
+        ));
+    }
+    for name in &functions {
+        let function = document
+            .functions
+            .get(name)
+            .ok_or_else(|| cg(&Loc::Function(name), "not found"))?;
+        let loc = Loc::Function(name);
+        walker.visit_signature(
+            &function.return_type,
+            &function.parameters,
+            function.variadic,
+            &loc,
+        )?;
+    }
+    walker.drain()?;
+
+    Generator::new(document, walker.used, functions, request.with_addresses)?.emit()
 }
 
 fn cg(loc: &Loc<'_>, detail: impl Into<String>) -> Error {
@@ -106,6 +173,8 @@ enum Loc<'a> {
     Root(&'a str),
     Type(&'a str),
     Field(&'a str, &'a str),
+    Functions,
+    Function(&'a str),
 }
 
 impl fmt::Display for Loc<'_> {
@@ -115,6 +184,8 @@ impl fmt::Display for Loc<'_> {
             Loc::Root(name) => write!(f, "root type `{name}`"),
             Loc::Type(name) => write!(f, "type `{name}`"),
             Loc::Field(ty, field) => write!(f, "type `{ty}`, field `{field}`"),
+            Loc::Functions => f.write_str("functions"),
+            Loc::Function(name) => write!(f, "function `{name}`"),
         }
     }
 }
@@ -256,20 +327,29 @@ impl<'a> Walker<'a> {
                 parameters,
                 variadic,
                 ..
-            } => {
-                if parameters.is_empty() && *variadic == Some(true) {
-                    return Err(cg(
-                        loc,
-                        "a variadic function needs at least one fixed parameter",
-                    ));
-                }
-                self.visit(return_type, Mode::Declare, loc)?;
-                for parameter in parameters {
-                    self.visit(&parameter.ty, Mode::Declare, loc)?;
-                }
-                Ok(())
-            }
+            } => self.visit_signature(return_type, parameters, *variadic, loc),
         }
+    }
+
+    /// Visit the declarations a function signature needs.
+    fn visit_signature(
+        &mut self,
+        return_type: &TypeRef,
+        parameters: &[Parameter],
+        variadic: Option<bool>,
+        loc: &Loc<'_>,
+    ) -> Result<()> {
+        if parameters.is_empty() && variadic == Some(true) {
+            return Err(cg(
+                loc,
+                "a variadic function needs at least one fixed parameter",
+            ));
+        }
+        self.visit(return_type, Mode::Declare, loc)?;
+        for parameter in parameters {
+            self.visit(&parameter.ty, Mode::Declare, loc)?;
+        }
+        Ok(())
     }
 
     fn visit_aggregate(&mut self, name: &str, mode: Mode, loc: &Loc<'_>) -> Result<()> {
@@ -355,9 +435,15 @@ fn merge_qualifiers(first: &[Qualifier], second: &[Qualifier]) -> Vec<Qualifier>
 /// operator at the identifier, which keeps `T (*p)[N]`, `T *p[N]`, function
 /// pointers and arrays of function pointers correct without string patching.
 fn declare(ty: &CType, name: &str) -> String {
+    declare_with_names(ty, name, None)
+}
+
+/// Render one declaration, naming the parameters of the outermost function.
+fn declare_with_names(ty: &CType, name: &str, names: Option<&[Option<String>]>) -> String {
     let mut text = String::from("?");
     let mut simple = true;
-    walk_type(ty, &mut text, &mut simple);
+    let mut names = names;
+    walk_type(ty, &mut text, &mut simple, &mut names);
     let declarator = text.replace('?', name);
     format!("{} {}", specifier(ty), declarator)
         .trim_end()
@@ -380,10 +466,15 @@ fn specifier(ty: &CType) -> String {
     }
 }
 
-fn walk_type(ty: &CType, text: &mut String, simple: &mut bool) {
+fn walk_type(
+    ty: &CType,
+    text: &mut String,
+    simple: &mut bool,
+    names: &mut Option<&[Option<String>]>,
+) {
     match ty {
         CType::Base(_) => {}
-        CType::Qualified(_, inner) => walk_type(inner, text, simple),
+        CType::Qualified(_, inner) => walk_type(inner, text, simple, names),
         CType::Pointer(to, qualifiers) => {
             // A pointer operator binds to the whole declarator built so far (and
             // the array/function steps below wrap it in parentheses when it is
@@ -392,7 +483,7 @@ fn walk_type(ty: &CType, text: &mut String, simple: &mut bool) {
             let star = format!("*{}", qualifier_prefix(qualifiers));
             *text = format!("{star}{text}");
             *simple = false;
-            walk_type(to, text, simple);
+            walk_type(to, text, simple, names);
         }
         CType::Array(of, count) => {
             let suffix = format!("[{count}]");
@@ -401,22 +492,27 @@ fn walk_type(ty: &CType, text: &mut String, simple: &mut bool) {
             } else {
                 *text = format!("({text}){suffix}");
             }
-            walk_type(of, text, simple);
+            walk_type(of, text, simple, names);
         }
         CType::Function(ret, parameters, variadic) => {
-            let suffix = format!("({})", parameter_text(parameters, *variadic));
+            // Only the outermost function of a declarator can be named.
+            let suffix = format!("({})", parameter_text(parameters, names.take(), *variadic));
             if *simple {
                 text.push_str(&suffix);
             } else {
                 *text = format!("({text}){suffix}");
             }
             *simple = false;
-            walk_type(ret, text, simple);
+            walk_type(ret, text, simple, names);
         }
     }
 }
 
-fn parameter_text(parameters: &[CType], variadic: bool) -> String {
+fn parameter_text(
+    parameters: &[CType],
+    names: Option<&[Option<String>]>,
+    variadic: bool,
+) -> String {
     if parameters.is_empty() {
         return if variadic {
             "...".to_string()
@@ -424,9 +520,20 @@ fn parameter_text(parameters: &[CType], variadic: bool) -> String {
             "void".to_string()
         };
     }
+    // `f(void)` names an empty list; a recorded name on that `void` is not C.
+    if parameters.len() == 1 && is_void(&parameters[0]) {
+        return "void".to_string();
+    }
     let mut parts: Vec<String> = parameters
         .iter()
-        .map(|parameter| declare(parameter, ""))
+        .enumerate()
+        .map(|(index, parameter)| {
+            let name = names
+                .and_then(|names| names.get(index))
+                .and_then(|name| name.as_deref())
+                .unwrap_or("");
+            declare(parameter, name)
+        })
         .collect();
     if variadic {
         parts.push("...".to_string());
@@ -522,6 +629,20 @@ fn is_c_keyword(name: &str) -> bool {
     )
 }
 
+/// True when the name is an identifier C can declare at file scope without
+/// stepping on the implementation's reserved forms (`_x`, `__x`).
+fn is_spellable_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(byte) if byte.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    if !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+        return false;
+    }
+    !is_c_keyword(name)
+}
+
 fn is_plain_identifier(name: &str) -> bool {
     let mut bytes = name.bytes();
     match bytes.next() {
@@ -546,8 +667,43 @@ fn field_identifier(original: &str, used: &mut BTreeSet<String>) -> String {
     unique_name(used, &candidate)
 }
 
+/// A parameter name, when the document records one that can be spelled in C.
+fn parameter_ident(name: Option<&str>, used: &mut BTreeSet<String>) -> Option<String> {
+    let name = name?;
+    // An unspellable or repeated name stays abstract: inventing one would hide
+    // the record's own naming instead of declaring it.
+    if !is_plain_identifier(name) || !used.insert(name.to_string()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// Escape free text for a C comment: JSON quoting removes control characters,
 /// and `*/` is defused so a record cannot end the comment early.
+/// A C string literal that keeps every byte of `text`.
+///
+/// `comment_text` defuses `*/` and is therefore wrong for data: the table must
+/// carry the document key unchanged.
+fn c_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for byte in text.bytes() {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            other => {
+                let _ = write!(out, "\\{other:03o}");
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn comment_text(text: &str) -> String {
     let quoted = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     quoted.replace("*/", "* /")
@@ -639,10 +795,18 @@ struct Generator<'a> {
     order: Vec<String>,
     accessors: BTreeMap<(String, String), AccessorNames>,
     checks: u64,
+    functions: Vec<String>,
+    function_names: BTreeMap<String, String>,
+    with_addresses: bool,
 }
 
 impl<'a> Generator<'a> {
-    fn new(doc: &'a IsfDocument, used: Used) -> Result<Self> {
+    fn new(
+        doc: &'a IsfDocument,
+        used: Used,
+        functions: Vec<String>,
+        with_addresses: bool,
+    ) -> Result<Self> {
         let mut generator = Generator {
             doc,
             pointer_size: doc.metadata.sym2isf.target.pointer_size,
@@ -656,7 +820,13 @@ impl<'a> Generator<'a> {
             order: Vec::new(),
             accessors: BTreeMap::new(),
             checks: 0,
+            functions,
+            function_names: BTreeMap::new(),
+            with_addresses,
         };
+        // Reserving the prototype names first lets a function keep a name that
+        // would otherwise look like one of the generated identifiers.
+        generator.function_names = generator.assign_function_names();
         generator.assign_type_names();
         generator.compute_layouts()?;
         generator.order = generator.definition_order()?;
@@ -673,6 +843,20 @@ impl<'a> Generator<'a> {
             .base_types
             .get(name)
             .is_some_and(|base| base.kind == BaseKind::Void)
+    }
+
+    fn assign_function_names(&mut self) -> BTreeMap<String, String> {
+        let mut names = BTreeMap::new();
+        for name in self.functions.clone() {
+            let candidate = if is_spellable_identifier(&name) {
+                name.clone()
+            } else {
+                format!("s2c_fn_{}", encode(&name))
+            };
+            let assigned = self.unique(&candidate);
+            names.insert(name, assigned);
+        }
+        names
     }
 
     fn assign_type_names(&mut self) {
@@ -1126,41 +1310,64 @@ impl<'a> Generator<'a> {
                 qualifiers,
                 ..
             } => {
-                if !qualifiers.is_empty() {
-                    return Err(cg(loc, "a function type cannot be qualified"));
-                }
-                let ret = self.ctype(return_type, chain, loc)?;
-                if matches!(ret, CType::Function(..)) {
-                    return Err(cg(loc, "function returns a function type"));
-                }
-                if matches!(ret, CType::Array(..)) {
-                    return Err(cg(loc, "function returns an array type"));
-                }
-                let mut rendered = Vec::with_capacity(parameters.len());
-                for parameter in parameters {
-                    rendered.push(self.ctype(&parameter.ty, chain, loc)?);
-                }
-                let variadic = *variadic == Some(true);
-                if variadic && rendered.is_empty() {
-                    return Err(cg(
-                        loc,
-                        "a variadic function needs at least one fixed parameter",
-                    ));
-                }
-                // `f(void)` names an empty list; `void` anywhere else is not C.
-                let voids = rendered
-                    .iter()
-                    .filter(|parameter| is_void(parameter))
-                    .count();
-                if voids > 0 && (voids != 1 || rendered.len() != 1 || variadic) {
-                    return Err(cg(
-                        loc,
-                        "void is only valid as the sole parameter of a prototype",
-                    ));
-                }
+                let (ret, rendered, variadic) = self.signature_parts(
+                    return_type,
+                    parameters,
+                    *variadic,
+                    qualifiers,
+                    chain,
+                    loc,
+                )?;
                 Ok(CType::Function(Box::new(ret), rendered, variadic))
             }
         }
+    }
+
+    /// Lower one function signature: the C return type, the C parameter types and
+    /// whether the declaration is variadic.
+    #[allow(clippy::too_many_arguments)]
+    fn signature_parts(
+        &self,
+        return_type: &TypeRef,
+        parameters: &[Parameter],
+        variadic: Option<bool>,
+        qualifiers: &[Qualifier],
+        chain: &mut Vec<String>,
+        loc: &Loc<'_>,
+    ) -> Result<(CType, Vec<CType>, bool)> {
+        if !qualifiers.is_empty() {
+            return Err(cg(loc, "a function type cannot be qualified"));
+        }
+        let ret = self.ctype(return_type, chain, loc)?;
+        if matches!(ret, CType::Function(..)) {
+            return Err(cg(loc, "function returns a function type"));
+        }
+        if matches!(ret, CType::Array(..)) {
+            return Err(cg(loc, "function returns an array type"));
+        }
+        let mut rendered = Vec::with_capacity(parameters.len());
+        for parameter in parameters {
+            rendered.push(self.ctype(&parameter.ty, chain, loc)?);
+        }
+        let variadic = variadic == Some(true);
+        if variadic && rendered.is_empty() {
+            return Err(cg(
+                loc,
+                "a variadic function needs at least one fixed parameter",
+            ));
+        }
+        // `f(void)` names an empty list; `void` anywhere else is not C.
+        let voids = rendered
+            .iter()
+            .filter(|parameter| is_void(parameter))
+            .count();
+        if voids > 0 && (voids != 1 || rendered.len() != 1 || variadic) {
+            return Err(cg(
+                loc,
+                "void is only valid as the sole parameter of a prototype",
+            ));
+        }
+        Ok((ret, rendered, variadic))
     }
 
     fn declared_qualifiers(&self, declared: Option<&TypeRef>) -> (bool, bool) {
@@ -1327,6 +1534,8 @@ impl<'a> Generator<'a> {
         self.emit_scalars(&mut out)?;
         self.emit_aggregates(&mut out)?;
         self.emit_aliases(&mut out)?;
+        self.emit_prototypes(&mut out)?;
+        self.emit_addresses(&mut out)?;
         self.emit_assertions(&mut out)?;
         self.emit_accessors(&mut out)?;
         Ok(out)
@@ -1626,6 +1835,92 @@ impl<'a> Generator<'a> {
             let name_text = comment_text(&name);
             line(out, format_args!("/* alias {name_text} -> {identifier} */"));
             line(out, format_args!("typedef {declaration};"));
+        }
+        blank(out);
+        Ok(())
+    }
+
+    fn emit_prototypes(&mut self, out: &mut String) -> Result<()> {
+        if self.functions.is_empty() {
+            return Ok(());
+        }
+        line(
+            out,
+            format_args!("/* function signatures: declarations only, no address binding */"),
+        );
+        for name in self.functions.clone() {
+            let function: IsfFunction = self.doc.functions[&name].clone();
+            let loc = Loc::Function(&name);
+            let mut scope: BTreeSet<String> = BTreeSet::new();
+            let names: Vec<Option<String>> = function
+                .parameters
+                .iter()
+                .map(|parameter| parameter_ident(parameter.name.as_deref(), &mut scope))
+                .collect();
+            let (ret, parameters, variadic) = self.signature_parts(
+                &function.return_type,
+                &function.parameters,
+                function.variadic,
+                &[],
+                &mut Vec::new(),
+                &loc,
+            )?;
+            // The whole declarator is rendered at once, so a function returning a
+            // pointer to a function or to an array keeps C's parentheses right.
+            let signature = CType::Function(Box::new(ret), parameters, variadic);
+            let identifier = self.function_names[&name].clone();
+            let declaration = declare_with_names(&signature, &identifier, Some(&names));
+            line(out, format_args!("/* function {} */", comment_text(&name)));
+            line(out, format_args!("extern {declaration};"));
+        }
+        blank(out);
+        Ok(())
+    }
+
+    fn emit_addresses(&mut self, out: &mut String) -> Result<()> {
+        if !self.with_addresses {
+            return Ok(());
+        }
+        let mut recorded: Vec<(String, u64)> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for name in &self.functions {
+            match self.doc.functions[name].address {
+                Some(address) => recorded.push((name.clone(), address)),
+                None => missing.push(name.clone()),
+            }
+        }
+        if recorded.is_empty() {
+            return Err(cg(
+                &Loc::Functions,
+                "no selected function has a recorded address",
+            ));
+        }
+        let record = self.unique("s2c_address");
+        let table = self.unique("s2c_addresses");
+        line(
+            out,
+            format_args!("/* recorded addresses: data only, no symbol binding */"),
+        );
+        line(out, format_args!("struct {record} {{"));
+        line(out, format_args!("    const char *name;"));
+        line(out, format_args!("    uint64_t address;"));
+        line(out, format_args!("}};"));
+        line(
+            out,
+            format_args!("static const struct {record} {table}[] = {{"),
+        );
+        for (name, address) in &recorded {
+            line(
+                out,
+                format_args!("    {{ {}, 0x{address:016x}ULL }},", c_string(name)),
+            );
+        }
+        line(out, format_args!("}};"));
+        for name in &missing {
+            line(
+                out,
+                format_args!("/* function {}: no recorded address */", comment_text(name)),
+            );
         }
         blank(out);
         Ok(())
