@@ -11,8 +11,6 @@
 //! module never takes a source name as a host ctype, and the module refuses to
 //! load when it cannot prove the layout it declared.
 
-use std::fmt::Write as _;
-
 use super::*;
 
 /// Append one line to the emitted module.
@@ -35,7 +33,9 @@ fn lua_string(text: &str) -> String {
             b'\\' => out.push_str("\\\\"),
             0x20..=0x7e => out.push(byte as char),
             other => {
-                let _ = write!(out, "\\{other:03}");
+                // `super::*` already brings `fmt::Write` in; naming the trait in
+                // full keeps this call independent of which import wins.
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\{other:03}"));
             }
         }
     }
