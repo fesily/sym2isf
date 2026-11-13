@@ -33,9 +33,7 @@ fn lua_string(text: &str) -> String {
             b'\\' => out.push_str("\\\\"),
             0x20..=0x7e => out.push(byte as char),
             other => {
-                // `super::*` already brings `fmt::Write` in; naming the trait in
-                // full keeps this call independent of which import wins.
-                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\{other:03}"));
+                let _ = write!(out, "\\{other:03}");
             }
         }
     }
